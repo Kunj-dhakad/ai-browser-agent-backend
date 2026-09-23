@@ -1,0 +1,24 @@
+{
+  "name": "ai-browser-agent",
+  "version": "1.0.0",
+  "description": "Express + Playwright browser agent that turns natural-language commands into Gmail actions and streams execution logs.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "login": "node agent.js --login",
+    "install-browser": "npx playwright install chromium"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "openai": "^7.23.0",
+    "playwright": "^1.49.1"
+  },
+  "license": "MIT"
+}

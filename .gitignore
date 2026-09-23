@@ -1,0 +1,17 @@
+node_modules/
+.env
+# Persistent browser profile contains live Google session cookies - never commit it.
+.browser-profile/
+screenshots/
+# Saved schedules (contain email text and addresses)
+data/
+
+# Any other env files with secrets (the .example file is committed)
+.env.*
+!.env.example
+
+# Logs and OS files
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
