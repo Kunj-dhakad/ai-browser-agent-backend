@@ -11,6 +11,13 @@
  *   GET  /api/agent/session    Is the browser profile signed in to Google?
  *   POST /api/agent/plan       { prompt } -> AI plan (OpenAI): the task, with the email written for you.
  *
+ *   Connect / disconnect Gmail from the dashboard (the sign-in page is shown in the live preview):
+ *   GET  /api/agent/login          Is a sign-in in progress?
+ *   POST /api/agent/login/start    Open Google's sign-in page.
+ *   POST /api/agent/login/input    { type: click, x, y (0-1) } | { type: type, text } | { type: key, key } | { type: scroll, deltaY }
+ *   POST /api/agent/login/cancel   Close the sign-in page.
+ *   POST /api/agent/logout         Sign the agent out of Google and forget the account.
+ *
  *   Runs (used by the dashboard; a run keeps going and can be re-watched after a page refresh):
  *   POST /api/agent/runs              Start a run from a (reviewed) { task, prompt? }, or from { prompt }
  *                                     alone (planned with AI first). Returns its id.
@@ -39,6 +46,11 @@ const {
   parseCommand,
   validateTask,
   checkSession,
+  startLogin,
+  sendLoginInput,
+  cancelLogin,
+  loginStatus,
+  logoutGmail,
   closeBrowser,
   getStatus,
   subscribeViewport,
@@ -131,6 +143,11 @@ function statusForError(code) {
       return 502; // the upstream AI service failed, not this server
     case 'CONTACT_NOT_FOUND':
       return 422;
+    case 'INVALID_INPUT':
+      return 400;
+    case 'ALREADY_LOGGED_IN':
+    case 'NO_LOGIN':
+      return 409;
     case 'LOGIN_REQUIRED':
     case 'PROFILE_IN_USE':
     case 'BROWSER_NOT_INSTALLED':
@@ -446,6 +463,44 @@ app.post('/api/agent/runs', async (req, res) => {
     }
     const run = startRun({ task, prompt, dryRun: dryRun === true });
     res.status(202).json({ success: true, run: runSummary(run) });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Connect / disconnect Gmail
+// ---------------------------------------------------------------------------
+
+app.get('/api/agent/login', (req, res) => {
+  res.json(loginStatus());
+});
+
+app.post('/api/agent/login/start', async (req, res) => {
+  try {
+    res.json({ success: true, login: await startLogin() });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+app.post('/api/agent/login/input', async (req, res) => {
+  try {
+    await sendLoginInput(req.body);
+    res.json({ success: true });
+  } catch (err) {
+    sendError(res, err);
+  }
+});
+
+app.post('/api/agent/login/cancel', async (req, res) => {
+  await cancelLogin();
+  res.json({ success: true });
+});
+
+app.post('/api/agent/logout', async (req, res) => {
+  try {
+    res.json({ success: true, ...(await logoutGmail()) });
   } catch (err) {
     sendError(res, err);
   }

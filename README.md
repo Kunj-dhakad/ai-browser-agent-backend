@@ -240,6 +240,21 @@ Run a planned task later or repeatedly. The task (for example, the AI-written em
 - Every 15 seconds the scheduler starts any due schedule as a normal run, marked `scheduled: true` in the run list.
 - If the backend was off at the scheduled time and more than an hour has passed, the occurrence is recorded as `missed` rather than sent late.
 
+### Connect / disconnect Gmail from the dashboard
+The Google sign-in page opens in the agent's own browser and is streamed through the normal live preview (`/api/agent/screencast`). The dashboard forwards the user's clicks and keys, so no VNC and no `npm run login` are needed, even on a headless server.
+
+| Endpoint | What it does |
+| --- | --- |
+| `POST /api/agent/login/start` | Opens Google's sign-in page. Returns `409 ALREADY_LOGGED_IN` if already connected. While it is open, the task queue is held |
+| `POST /api/agent/login/input` | `{ "type": "click", "x": 0-1, "y": 0-1 }` (fractions of the picture) · `{ "type": "type", "text": "…" }` · `{ "type": "key", "key": "Enter" }` (Enter, Tab, Backspace, Delete, Escape, arrows, Home, End) · `{ "type": "scroll", "deltaY": 300 }` |
+| `GET /api/agent/login` | `{ active, url }` while signing in, otherwise `{ active: false, lastResult: { reason: success \| cancelled \| timeout \| closed } }` |
+| `POST /api/agent/login/cancel` | Closes the sign-in page |
+| `POST /api/agent/logout` | Visits Google's sign-out page, clears all cookies of the agent's profile and forgets the saved account |
+
+- The sign-in finishes by itself as soon as Gmail's inbox loads, and the account name is saved at that point.
+- A sign-in left open closes after 10 minutes.
+- Google refuses sign-ins from Chromium's default headless shell ("This browser or app may not be secure"). In headless mode the agent therefore runs Chromium's **new headless** mode (`channel: "chromium"`) and presents a regular Chrome user agent and client-hint brands. With this setup, testing reached Google's password page.
+
 ### `GET /api/agent/session`
 Reports whether the browser profile is signed in to Google. It checks Google's session cookies without opening a page. The result is cached for 60 seconds; `?refresh=1` skips the cache.
 ```json

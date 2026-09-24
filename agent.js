@@ -20,6 +20,7 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const { EventEmitter } = require('events');
+const crypto = require('crypto');
 const { chromium, errors: playwrightErrors } = require('playwright');
 
 // ---------------------------------------------------------------------------
@@ -601,9 +602,12 @@ let pendingTasks = 0;
 
 /** Launch options shared by the agent and the interactive login helper. */
 function launchOptions(overrides = {}) {
+  const headless = overrides.headless ?? CONFIG.headless;
   return {
-    headless: CONFIG.headless,
-    channel: CONFIG.channel,
+    headless,
+    // Headless uses Chromium's "new headless" mode (the full browser, just without a window).
+    // The default headless shell is easy to detect and Google refuses sign-ins from it.
+    channel: CONFIG.channel || (headless ? 'chromium' : undefined),
     slowMo: CONFIG.slowMoMs,
     viewport: CONFIG.viewport,
     // Google blocks sign-in from browsers that announce they're automated.
@@ -752,7 +756,7 @@ function lookupAccountInBackground() {
     let page;
     try {
       const context = await getContext(createLogger());
-      page = await context.newPage();
+      page = await openPage(context);
       await page.goto(GMAIL_URL, { waitUntil: 'domcontentloaded' });
       await page.locator(SELECTORS.composeButton).first().waitFor({ state: 'visible', timeout: 30_000 });
       await readAccount(page);
@@ -803,6 +807,207 @@ async function checkLogin({ force = false } = {}) {
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// Connect / disconnect Gmail from the dashboard
+// ---------------------------------------------------------------------------
+//
+// "Connect Gmail" opens Google's sign-in page in the agent's own browser and streams it to
+// the dashboard (the normal live preview). The user's clicks and keys are sent back with
+// sendLoginInput(), so they sign in from any browser, with no VNC or `npm run login` needed.
+// While a sign-in is open it holds the task queue, so no task touches the browser meanwhile.
+
+const LOGIN_URL = 'https://accounts.google.com/ServiceLogin?service=mail&continue=https%3A%2F%2Fmail.google.com%2Fmail%2F';
+const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
+const LOGIN_KEYS = new Set(['Enter', 'Tab', 'Backspace', 'Delete', 'Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'Space']);
+
+let login = null; // the sign-in in progress: { id, page, stopScreencast, release, watcher, timer, startedAt }
+let lastLoginResult = null; // { reason: 'success' | 'cancelled' | 'timeout' | 'closed', at }
+
+function loginStatus() {
+  if (!login) return { active: false, ...(lastLoginResult ? { lastResult: lastLoginResult } : {}) };
+  return { active: true, id: login.id, startedAt: login.startedAt, url: login.page.isClosed() ? null : login.page.url() };
+}
+
+/**
+ * Headless Chromium calls itself "HeadlessChrome" in its user agent and in the client-hint
+ * brands, which makes Google refuse sign-ins ("This browser or app may not be secure").
+ * Presents the normal Chrome name in both. Returns the CDP session (kept on the page so the
+ * override stays active), or null when nothing needed changing.
+ */
+async function useRegularUserAgent(page) {
+  try {
+    const { ua, brands } = await page.evaluate(() => ({
+      ua: navigator.userAgent,
+      brands: navigator.userAgentData ? navigator.userAgentData.brands : [],
+    }));
+    if (!/Headless/i.test(ua)) return null;
+    const platform = { win32: 'Windows', darwin: 'macOS', linux: 'Linux' }[process.platform] || 'Linux';
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('Network.setUserAgentOverride', {
+      userAgent: ua.replace(/HeadlessChrome/g, 'Chrome'),
+      userAgentMetadata: {
+        brands: brands.map((b) => ({ brand: b.brand.replace('HeadlessChrome', 'Google Chrome'), version: b.version })),
+        fullVersion: '',
+        platform,
+        platformVersion: '',
+        architecture: process.arch === 'arm64' ? 'arm' : 'x86',
+        model: '',
+        mobile: false,
+      },
+    });
+    return cdp;
+  } catch {
+    return null;
+  }
+}
+
+/** New tab in the agent's browser, presented as regular Chrome (see useRegularUserAgent). */
+async function openPage(context) {
+  const page = await context.newPage();
+  page.uaSession = await useRegularUserAgent(page);
+  return page;
+}
+
+/** Opens Google's sign-in page for the user to fill in through the dashboard. */
+async function startLogin() {
+  if (login) return loginStatus();
+  const current = await checkLogin({ force: true });
+  if (current.loggedIn) {
+    throw new AgentError('ALREADY_LOGGED_IN', 'Gmail is already connected. Log out first to connect a different account.');
+  }
+
+  let release;
+  const held = new Promise((resolve) => {
+    release = resolve;
+  });
+  const opened = new Promise((resolve, reject) => {
+    enqueue(async () => {
+      try {
+        const log = createLogger();
+        const context = await getContext(log);
+        const page = await openPage(context);
+        const stopScreencast = await startScreencast(page, log);
+        await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded' });
+        login = { id: crypto.randomUUID(), page, stopScreencast, release, startedAt: new Date().toISOString() };
+        login.watcher = setInterval(checkLoginDone, 1500);
+        login.timer = setTimeout(() => endLogin('timeout'), LOGIN_TIMEOUT_MS);
+        page.on('close', () => endLogin('closed'));
+        resolve();
+      } catch (err) {
+        release();
+        reject(err instanceof AgentError ? err : new AgentError('LOGIN_FAILED', `Could not open the Google sign-in page: ${err.message}`));
+      }
+      await held; // keep the queue until the sign-in ends
+    });
+  });
+  await opened;
+  return loginStatus();
+}
+
+/** Finishes the sign-in automatically once Gmail's inbox has loaded. */
+async function checkLoginDone() {
+  const l = login;
+  if (!l || l.checking || l.page.isClosed()) return;
+  l.checking = true;
+  try {
+    if (/^https:\/\/mail\.google\.com\/mail\//.test(l.page.url())) {
+      const inbox = await l.page.locator(SELECTORS.composeButton).first().isVisible().catch(() => false);
+      if (inbox && login === l) {
+        await readAccount(l.page);
+        await endLogin('success');
+      }
+    }
+  } finally {
+    l.checking = false;
+  }
+}
+
+async function endLogin(reason) {
+  const l = login;
+  if (!l) return;
+  login = null;
+  clearInterval(l.watcher);
+  clearTimeout(l.timer);
+  await l.stopScreencast().catch(() => {});
+  if (!l.page.isClosed()) await l.page.close().catch(() => {});
+  sessionCache = null; // next check re-reads the cookies
+  lastLoginResult = { reason, at: new Date().toISOString() };
+  l.release();
+}
+
+const cancelLogin = () => endLogin('cancelled');
+
+const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
+
+/**
+ * A click / key / text / scroll from the dashboard, applied to the sign-in page.
+ * Click positions are fractions (0-1) of the picture, so they don't depend on screen size.
+ */
+async function sendLoginInput(input) {
+  const l = login;
+  if (!l || l.page.isClosed()) throw new AgentError('NO_LOGIN', 'No Gmail sign-in is in progress.');
+  const bad = (m) => {
+    throw new AgentError('INVALID_INPUT', m);
+  };
+  const { page } = l;
+  switch (input && input.type) {
+    case 'click': {
+      const x = Number(input.x);
+      const y = Number(input.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) bad('Click needs x and y.');
+      await page.mouse.click(clamp(x, 0, 1) * CONFIG.viewport.width, clamp(y, 0, 1) * CONFIG.viewport.height);
+      break;
+    }
+    case 'type':
+      if (typeof input.text !== 'string' || !input.text || input.text.length > 500) bad('Text must be 1-500 characters.');
+      await page.keyboard.type(input.text, { delay: 25 });
+      break;
+    case 'key':
+      if (!LOGIN_KEYS.has(input.key)) bad('That key is not allowed.');
+      await page.keyboard.press(input.key === 'Space' ? ' ' : input.key);
+      break;
+    case 'scroll': {
+      const dy = Number(input.deltaY);
+      if (!Number.isFinite(dy)) bad('Scroll needs deltaY.');
+      await page.mouse.wheel(0, clamp(dy, -2000, 2000));
+      break;
+    }
+    default:
+      bad('Unknown input type.');
+  }
+  setTimeout(checkLoginDone, 800); // a click or Enter may just have finished the sign-in
+}
+
+/**
+ * Signs the agent out of Google: visits Google's sign-out page, clears every cookie of the
+ * agent's browser profile and forgets the saved account name.
+ */
+async function logoutGmail() {
+  if (login) await endLogin('cancelled');
+  return enqueue(async () => {
+    const context = await getContext(createLogger());
+    const page = await openPage(context);
+    try {
+      await page.goto('https://accounts.google.com/Logout', { waitUntil: 'domcontentloaded', timeout: 20_000 });
+      await sleep(1500);
+    } catch {
+      // Offline or slow: clearing the cookies below still signs this browser out.
+    } finally {
+      await page.close().catch(() => {});
+    }
+    await context.clearCookies();
+    account = null;
+    try {
+      fs.unlinkSync(ACCOUNT_FILE);
+    } catch {
+      // No saved account.
+    }
+    lastFrame = null; // don't keep showing the old inbox in the preview
+    sessionCache = { result: { loggedIn: false, checkedAt: new Date().toISOString() }, at: Date.now() };
+    return { loggedIn: false };
+  });
+}
+
 function getStatus() {
   return {
     browserRunning: Boolean(contextPromise),
@@ -810,6 +1015,7 @@ function getStatus() {
     headless: CONFIG.headless,
     dryRun: CONFIG.dryRun,
     previewActive: viewportState.active,
+    loginActive: Boolean(login),
   };
 }
 
@@ -1219,7 +1425,7 @@ async function runBrowserAgent(input, { onLog, dryRun = false, postProcess } = {
     let stopScreencast = async () => {};
     try {
       const context = await getContext(log);
-      page = await context.newPage();
+      page = await openPage(context);
       stopScreencast = await startScreencast(page, log);
       await openGmail(page, log);
       await readAccount(page); // remember who is signed in (used to sign emails)
@@ -1321,6 +1527,11 @@ module.exports = {
   getAccount,
   readAccount,
   senderName,
+  startLogin,
+  sendLoginInput,
+  cancelLogin,
+  loginStatus,
+  logoutGmail,
   closeBrowser,
   getStatus,
   subscribeViewport,
