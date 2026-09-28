@@ -1097,7 +1097,7 @@ async function sendLoginInput(userId, input) {
     }
     case 'type':
       if (typeof input.text !== 'string' || !input.text || input.text.length > 500) bad('Text must be 1-500 characters.');
-      await page.keyboard.type(input.text, { delay: 25 });
+      await page.keyboard.type(input.text); // no per-key delay: the user's own typing speed already reached us
       break;
     case 'key':
       if (!LOGIN_KEYS.has(input.key)) bad('That key is not allowed.');
