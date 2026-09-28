@@ -1,0 +1,137 @@
+/**
+ * db.js
+ * ---------------------------------------------------------------------------
+ * Small SQLite database (Node's built-in `node:sqlite`, no extra package) for
+ * multi-user mode: users, their Gmail connection and daily usage.
+ *
+ * File: data/app.db (DB_FILE). Runs stay in memory (see server.js); schedules
+ * stay in data/schedules.json with a userId on each one.
+ * ---------------------------------------------------------------------------
+ */
+
+require('dotenv').config();
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const { DatabaseSync } = require('node:sqlite');
+
+const DB_FILE = path.resolve(process.env.DB_FILE || './data/app.db');
+fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });
+
+const db = new DatabaseSync(DB_FILE);
+db.exec(`
+  PRAGMA journal_mode = WAL;
+  PRAGMA foreign_keys = ON;
+
+  CREATE TABLE IF NOT EXISTS users (
+    id                TEXT PRIMARY KEY,
+    email             TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    name              TEXT NOT NULL,
+    password_hash     TEXT NOT NULL,
+    role              TEXT NOT NULL DEFAULT 'user',      -- 'admin' | 'user'
+    disabled          INTEGER NOT NULL DEFAULT 0,
+    daily_email_limit INTEGER,                           -- NULL = use DAILY_EMAIL_LIMIT
+    gmail_status      TEXT NOT NULL DEFAULT 'unknown',   -- 'connected' | 'disconnected' | 'unknown'
+    gmail_name        TEXT,
+    gmail_email       TEXT,
+    created_at        TEXT NOT NULL,
+    last_login_at     TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS usage (
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    day     TEXT NOT NULL,                               -- YYYY-MM-DD, server local time
+    emails  INTEGER NOT NULL DEFAULT 0,                  -- emails actually sent
+    runs    INTEGER NOT NULL DEFAULT 0,                  -- runs started
+    PRIMARY KEY (user_id, day)
+  );
+`);
+
+const DEFAULT_DAILY_EMAIL_LIMIT = parseInt(process.env.DAILY_EMAIL_LIMIT, 10) || 50;
+
+/** Today's date as YYYY-MM-DD in the server's time zone. */
+function today() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/** The user as the API returns it: never the password hash. */
+function publicUser(u) {
+  if (!u) return null;
+  return {
+    id: u.id,
+    email: u.email,
+    name: u.name,
+    role: u.role,
+    disabled: Boolean(u.disabled),
+    dailyEmailLimit: u.daily_email_limit ?? DEFAULT_DAILY_EMAIL_LIMIT,
+    gmail: { status: u.gmail_status, name: u.gmail_name || null, email: u.gmail_email || null },
+    createdAt: u.created_at,
+    lastLoginAt: u.last_login_at || null,
+  };
+}
+
+const stmt = {
+  byId: db.prepare('SELECT * FROM users WHERE id = ?'),
+  byEmail: db.prepare('SELECT * FROM users WHERE email = ?'),
+  all: db.prepare('SELECT * FROM users ORDER BY created_at'),
+  count: db.prepare('SELECT COUNT(*) AS n FROM users'),
+  firstAdmin: db.prepare("SELECT * FROM users WHERE role = 'admin' ORDER BY created_at LIMIT 1"),
+  insert: db.prepare(
+    'INSERT INTO users (id, email, name, password_hash, role, daily_email_limit, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+  ),
+  remove: db.prepare('DELETE FROM users WHERE id = ?'),
+  touchLogin: db.prepare('UPDATE users SET last_login_at = ? WHERE id = ?'),
+  gmailStatus: db.prepare('UPDATE users SET gmail_status = ? WHERE id = ?'),
+  gmailAccount: db.prepare("UPDATE users SET gmail_status = 'connected', gmail_name = ?, gmail_email = ? WHERE id = ?"),
+  gmailClear: db.prepare("UPDATE users SET gmail_status = 'disconnected', gmail_name = NULL, gmail_email = NULL WHERE id = ?"),
+  usageGet: db.prepare('SELECT emails, runs FROM usage WHERE user_id = ? AND day = ?'),
+  usageAdd: db.prepare(`
+    INSERT INTO usage (user_id, day, emails, runs) VALUES (?, ?, ?, ?)
+    ON CONFLICT (user_id, day) DO UPDATE SET emails = emails + excluded.emails, runs = runs + excluded.runs
+  `),
+};
+
+const users = {
+  get: (id) => stmt.byId.get(id) || null,
+  getByEmail: (email) => stmt.byEmail.get(String(email || '').trim()) || null,
+  list: () => stmt.all.all(),
+  count: () => stmt.count.get().n,
+  firstAdmin: () => stmt.firstAdmin.get() || null,
+
+  /** Creates a user. `passwordHash` comes from auth.hashPassword(). */
+  create({ email, name, passwordHash, role = 'user', dailyEmailLimit = null }) {
+    const id = crypto.randomUUID();
+    stmt.insert.run(id, email.trim(), name.trim(), passwordHash, role, dailyEmailLimit, new Date().toISOString());
+    return users.get(id);
+  },
+
+  /** Updates the given fields only (name, role, disabled, password_hash, daily_email_limit). */
+  update(id, patch) {
+    const allowed = ['name', 'role', 'disabled', 'password_hash', 'daily_email_limit'];
+    const keys = Object.keys(patch).filter((k) => allowed.includes(k));
+    if (keys.length) {
+      db.prepare(`UPDATE users SET ${keys.map((k) => `${k} = ?`).join(', ')} WHERE id = ?`).run(...keys.map((k) => patch[k]), id);
+    }
+    return users.get(id);
+  },
+
+  remove: (id) => stmt.remove.run(id),
+  touchLogin: (id) => stmt.touchLogin.run(new Date().toISOString(), id),
+
+  // Gmail connection of the user's agent browser
+  setGmailStatus: (id, status) => stmt.gmailStatus.run(status, id),
+  setGmailAccount: (id, name, email) => stmt.gmailAccount.run(name, email, id),
+  clearGmail: (id) => stmt.gmailClear.run(id),
+};
+
+const usage = {
+  /** { emails, runs } used today. */
+  today: (userId) => stmt.usageGet.get(userId, today()) || { emails: 0, runs: 0 },
+  add: (userId, { emails = 0, runs = 0 }) => stmt.usageAdd.run(userId, today(), emails, runs),
+  /** How many emails this user may send per day. */
+  limitFor: (user) => user.daily_email_limit ?? DEFAULT_DAILY_EMAIL_LIMIT,
+};
+
+module.exports = { db, users, usage, publicUser, today, DB_FILE };

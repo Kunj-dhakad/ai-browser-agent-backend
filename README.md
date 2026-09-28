@@ -11,14 +11,18 @@ Next.js frontend ──POST /api/agent/stream──▶ Express (server.js)
       ▲                                           │
       └──────── Server-Sent Events (logs) ◀────── agent.js ──▶ Playwright ──▶ Chromium ──▶ Gmail
                                                      │
-                                          .browser-profile/ (saved Google session)
+                                          data/profiles/<userId>/ (each user's saved Google session)
 ```
+
+Several people can use it at once: each user signs in with an email and password, connects their own Gmail, and only ever sees their own browser, runs and schedules. Up to `MAX_BROWSERS` (default 10) browsers run at the same time; when all are busy, other users wait in line and get the next browser that frees up.
 
 ## Features
 
-- **AI planning with OpenAI:** a single sentence in English, Hindi or Hinglish (rough notes are fine) becomes a Gmail task through Structured Outputs. The AI writes a complete, well-structured English email: specific subject, greeting, short paragraphs and a closing, in a tone that fits the recipient, keeping every fact you gave. It is signed with `SENDER_NAME` when set. The AI also summarizes search and inbox results in English. Without a key, a rule-based parser handles simple English commands.
+- **AI planning with OpenAI:** a single sentence in English, Hindi or Hinglish (rough notes are fine) becomes a Gmail task through Structured Outputs. The AI writes a complete, well-structured English email: specific subject, greeting, short paragraphs and a closing, in a tone that fits the recipient, keeping every fact you gave. It is signed with the user's Gmail account name. The AI also summarizes search and inbox results in English. Without a key, a rule-based parser handles simple English commands.
 - **Natural-language commands:** send or draft emails, search Gmail, and read the inbox.
-- **Persistent login:** `chromium.launchPersistentContext` keeps the Google cookies in `USER_DATA_DIR`. You sign in and pass 2FA once, and the session is reused after that.
+- **Multi-user:** email + password accounts (SQLite, `node:sqlite`), an admin who manages users, per-user Gmail, runs, schedules and live preview, and a daily email limit per user.
+- **Browser pool:** one browser per active user, at most `MAX_BROWSERS` at once. Idle browsers close after `BROWSER_IDLE_MINUTES`; when the pool is full an idle browser is closed to make room, and if every browser is busy the user waits in line (the run's log says so).
+- **Persistent login:** `chromium.launchPersistentContext` keeps each user's Google cookies in `data/profiles/<userId>`. They sign in and pass 2FA once, and the session is reused after that.
 - **Human-like typing:** each character is typed with a random delay, with longer pauses after spaces and punctuation.
 - **Headed or headless:** `HEADLESS=false` shows the browser for local testing. `HEADLESS=true` runs without a window on servers.
 - **Step logs:** you can get all logs at once in the JSON response, or stream them live over Server-Sent Events.
@@ -28,7 +32,10 @@ Next.js frontend ──POST /api/agent/stream──▶ Express (server.js)
 
 | File | Purpose |
 | --- | --- |
-| `server.js` | Express API: CORS, auth, JSON and SSE endpoints, shutdown |
+| `server.js` | Express API: CORS, API key, user login, admin, JSON and SSE endpoints, shutdown |
+| `db.js` | SQLite database (`data/app.db`): users, their Gmail connection, daily usage |
+| `auth.js` | Password hashing (scrypt), signed login tokens, login attempt limiter |
+| `scripts/add-user.js` | Create a user from the command line (`npm run add-user`) |
 | `planner.js` | OpenAI "brain": `planTask(prompt)` turns a request into a task and writes the email; `createSummarizer()` summarizes results |
 | `scheduler.js` | Scheduled tasks (once / daily / weekly), saved to `data/schedules.json` and checked every 15 seconds |
 | `agent.js` | Browser lifecycle, Gmail automation, `runBrowserAgent(task | prompt)`, `validateTask`, rule-based fallback parser, CLI |
@@ -37,7 +44,7 @@ Next.js frontend ──POST /api/agent/stream──▶ Express (server.js)
 
 ## Installation
 
-Requirements: **Node.js 18+**.
+Requirements: **Node.js 22.13+** (for the built-in `node:sqlite`).
 
 ```bash
 # 1. Install the Node dependencies
@@ -50,24 +57,22 @@ npx playwright install chromium
 
 # 3. Create your config
 cp .env.example .env        # Windows PowerShell: Copy-Item .env.example .env
-#    then edit .env: set AGENT_API_KEY, OPENAI_API_KEY and CORS_ORIGINS
+#    then edit .env: set AGENT_API_KEY, AUTH_SECRET, OPENAI_API_KEY and CORS_ORIGINS
+
+# 4. Create the first admin (asks for email, name and password)
+npm run add-user -- --admin
 ```
 
-## First-time Gmail login (one time only)
+## Users and Gmail
 
-Google requires a real person to sign in the first time. Run this on the machine that will run the agent:
+- **Admin:** create the first one with `npm run add-user -- --admin`. Admins add, edit, disable and delete users on the dashboard's **Manage users** page (or with `npm run add-user -- --email x@y.com --name "X" --password "..."`).
+- **Gmail:** each user signs in to the dashboard, opens the Gmail agent and clicks **Connect Gmail**. Google's sign-in page opens in that user's own agent browser and is shown live in the dashboard; they sign in and pass 2FA once. No VNC or terminal needed, also on a headless server.
+- **Upgrading from the single-user version:** the first admin created with `add-user --admin` takes over the old `.browser-profile` folder and `data/account.json`, so that Gmail stays connected.
+- **Terminal alternative:** `npm run login -- <user email>` opens a visible browser window to sign that user in (needs a display).
 
-```bash
-npm run login
-```
+> **If Google says "This browser or app may not be secure":** set `BROWSER_CHANNEL=chrome` in `.env` to use your installed Google Chrome, then connect again.
 
-A browser window opens on Gmail. Sign in, complete 2FA, and wait for your inbox to load. Then close the window. The session is now stored in `USER_DATA_DIR` (default `./.browser-profile`), and later runs, including headless ones, stay logged in.
-
-> **If Google says "This browser or app may not be secure":** set `BROWSER_CHANNEL=chrome` in `.env` to use your installed Google Chrome, then run `npm run login` again. Use the same channel for both the login and the server.
-
-> **Headless servers with no display:** run `npm run login` on your own computer, then copy the whole `.browser-profile` folder to the server, using the same `BROWSER_CHANNEL`. On Linux you can also run the login under `xvfb-run npm run login` over VNC.
-
-**Security:** `.browser-profile/` holds live Google session cookies, so anyone with the folder can use your mailbox. It is listed in `.gitignore`. Keep it private.
+**Security:** `data/` holds the user database and every user's live Google session cookies (`data/profiles/`). It is listed in `.gitignore`. Keep it private and back it up.
 
 ## Running
 
@@ -103,14 +108,25 @@ Before you run a command, you can check how it will be understood with `POST /ap
 
 ## API
 
-Every `/api/*` route needs the `x-api-key` header whenever `AGENT_API_KEY` is set. The request body is `{ "prompt": "...", "dryRun": false }`. `dryRun` is optional; set it to `true` to save that one email to Drafts instead of sending it. The dashboard's Safe mode switch uses it.
+Every `/api/*` route needs the `x-api-key` header whenever `AGENT_API_KEY` is set, and every route except `POST /api/auth/login` also needs `Authorization: Bearer <token>` of a signed-in user. Everything is scoped to that user: runs, schedules, the live preview and the Gmail connection of other users are never visible (their ids return 404). The request body is `{ "prompt": "...", "dryRun": false }`. `dryRun` is optional; set it to `true` to save that one email to Drafts instead of sending it. The dashboard's Safe mode switch uses it.
 
 The ready-made dashboard in `../frontend` already calls these endpoints through a server-side proxy. The `fetch` example below is for building your own client.
 
 ### `GET /health`
 ```json
-{ "status": "ok", "uptimeSeconds": 42, "agent": { "browserRunning": true, "pendingTasks": 0, "headless": true, "dryRun": false } }
+{ "status": "ok", "uptimeSeconds": 42, "agent": { "openBrowsers": 3, "maxBrowsers": 10, "waitingForBrowser": 0, "pendingTasks": 2, "headless": true, "dryRun": false } }
 ```
+No login needed; contains no user data.
+
+### Users
+| Method | Path | |
+| --- | --- | --- |
+| `POST` | `/api/auth/login` | `{ email, password }` → `{ token, user, expiresInHours }`. 10 wrong passwords per email + IP → `TOO_MANY_ATTEMPTS` for 15 min |
+| `GET` | `/api/auth/me` | The signed-in user and today's usage `{ emails, runs }` |
+| `GET` | `/api/admin/users` | Admin: all users with Gmail status and today's usage |
+| `POST` | `/api/admin/users` | Admin: `{ email, name, password, role?, dailyEmailLimit? }` |
+| `PATCH` | `/api/admin/users/:id` | Admin: `{ name?, role?, disabled?, password?, dailyEmailLimit? }` |
+| `DELETE` | `/api/admin/users/:id` | Admin: deletes the user, their browser profile and schedules |
 
 ### `POST /api/agent/parse`
 Interprets the prompt only. No browser is opened.
@@ -272,14 +288,18 @@ If the check isn't possible, `loggedIn` is `null` and `reason` says why (for exa
 | `AI_RATE_LIMIT` | 429 | OpenAI rate limit. Retry shortly |
 | `RUN_NOT_FOUND` | 404 | The run id is unknown (server restarted, or the run is older than 1 hour) |
 | `UNAUTHORIZED` | 401 | The `x-api-key` header is missing or wrong |
+| `UNAUTHENTICATED`, `BAD_LOGIN` | 401 | Not signed in / login expired / user disabled, or wrong email or password |
+| `FORBIDDEN` | 403 | Admin-only route |
+| `DAILY_LIMIT`, `TOO_MANY_ATTEMPTS` | 429 | The user's daily email limit is used up; too many wrong passwords |
+| `BROWSERS_BUSY` | 503 | Connect Gmail while all `MAX_BROWSERS` browsers are busy. Try again in a minute (runs wait in line instead) |
 | `CONTACT_NOT_FOUND` | 422 | Gmail autocomplete found no contact with that name |
-| `LOGIN_REQUIRED` | 503 | The profile isn't signed in. Run `npm run login` |
-| `PROFILE_IN_USE` | 503 | Another browser is using `USER_DATA_DIR` |
+| `LOGIN_REQUIRED` | 503 | The user's Gmail isn't connected. Click **Connect Gmail** |
+| `PROFILE_IN_USE` | 503 | Another browser (e.g. `npm run login`) is using this user's profile |
 | `BROWSER_NOT_INSTALLED` | 503 | Run `npx playwright install chromium` |
 | `TIMEOUT` | 504 | A Gmail element didn't appear within `ACTION_TIMEOUT_MS` |
 | `SEND_FAILED` | 500 | Gmail rejected the message, for example because of an invalid address |
 
-When a browser step fails, the agent saves a screenshot to `./screenshots/` and puts its path in the logs.
+When a browser step fails, the agent saves a screenshot to `./screenshots/<userId>/` and puts its path in the logs.
 
 ## Configuration (`.env`)
 
@@ -289,7 +309,14 @@ When a browser step fails, the agent saves a screenshot to `./screenshots/` and 
 | `CORS_ORIGINS` | `http://localhost:3000` | Comma-separated list of allowed frontend origins (`*` allows all) |
 | `AGENT_API_KEY` | *(empty)* | Shared secret for the `x-api-key` header. Always set this in production |
 | `HEADLESS` | `true` | `false` shows the browser window |
-| `USER_DATA_DIR` | `./.browser-profile` | Folder for the persistent browser profile (the saved session) |
+| `AUTH_SECRET` | *(random)* | Secret (32+ characters) that signs login tokens. If empty, everyone is logged out on each restart |
+| `SESSION_HOURS` | `12` | How long a login lasts |
+| `DB_FILE` | `./data/app.db` | SQLite user database |
+| `MAX_BROWSERS` | `10` | Browsers open at the same time (all users). About 300–400 MB RAM each |
+| `BROWSER_IDLE_MINUTES` | `5` | Close a user's browser after this many idle minutes |
+| `DAILY_EMAIL_LIMIT` | `50` | Emails each user may send per day (admins can change it per user) |
+| `PROFILES_DIR` | `./data/profiles` | One browser profile (saved Google session) per user |
+| `USER_DATA_DIR` | `./.browser-profile` | Old single-user profile, moved to the first admin by `add-user --admin` |
 | `BROWSER_CHANNEL` | *(bundled Chromium)* | `chrome` or `msedge` to use an installed browser |
 | `TYPING_DELAY_MS` | `80` | Average delay between keystrokes |
 | `SLOW_MO_MS` | `0` | Extra delay on every Playwright action, useful when watching the agent |
@@ -298,7 +325,6 @@ When a browser step fails, the agent saves a screenshot to `./screenshots/` and 
 | `OPENAI_API_KEY` | *(empty)* | OpenAI key. Empty means no AI (rule-based parser, English only) |
 | `OPENAI_MODEL` | `gpt-4.1-mini` | Any chat model with Structured Outputs support |
 | `OPENAI_SUMMARIZE` | `true` | AI summary of search and inbox results. This sends the senders, subjects and snippets of those emails to OpenAI |
-| `SENDER_NAME` | *(empty)* | Your name. When set, AI-written emails end with "Best regards," and this name. When empty, the email ends with the closing line only |
 | `SCHEDULES_FILE` | `./data/schedules.json` | Where schedules are saved |
 | `SCREENCAST_ENABLED` | `true` | Stream the live browser preview |
 | `SCREENCAST_QUALITY` | `80` | JPEG quality of preview frames (1–100). Small text blurs below ~75 |
@@ -308,8 +334,8 @@ When a browser step fails, the agent saves a screenshot to `./screenshots/` and 
 ## Deployment notes
 
 - **Where it can run:** the agent needs a long-running process with a writable disk for the browser profile. A VM, EC2, Railway, Render or Fly.io with a volume, or Docker all work. Serverless functions (Vercel or Amplify functions, Lambda) do **not** work: they have time limits, no persistent disk, and no Chromium. Host the Next.js frontend on Vercel or Amplify and this API somewhere else.
-- **Docker:** start from the official `mcr.microsoft.com/playwright` image, which includes Chromium and its libraries, and mount `USER_DATA_DIR` as a volume.
-- **One task at a time:** a browser profile can only be driven by one task at a time, so tasks run in order. Concurrent requests wait their turn (see `pendingTasks` in `/health`). To run more at once, start several instances, each with its own profile and account.
+- **Docker:** start from the official `mcr.microsoft.com/playwright` image, which includes Chromium and its libraries, and mount `data/` as a volume.
+- **Capacity:** each user's tasks run one at a time in their own browser; different users run in parallel up to `MAX_BROWSERS`. Size the server for it: roughly 4 GB RAM for 10 browsers (e.g. EC2 t3.medium). `/health` shows `openBrowsers` and `waitingForBrowser`.
 - **Behind a proxy:** turn off response buffering for `/api/agent/stream` (the server already sends `X-Accel-Buffering: no` for nginx). The server also sends a heartbeat comment every 15 seconds so idle connections stay open.
 - **Gmail markup changes:** all Gmail selectors are kept in `SELECTORS` at the top of `agent.js`. If Google changes its interface, that is the only place to update.
 - **Responsible use:** this agent sends real email from your account. Keep `AGENT_API_KEY` secret, use `DRY_RUN` while testing, and follow Google's Terms of Service. Automating accounts you don't own, or sending bulk or unsolicited mail, is not allowed.

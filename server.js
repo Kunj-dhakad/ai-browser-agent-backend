@@ -1,37 +1,43 @@
 /**
  * server.js
  * ---------------------------------------------------------------------------
- * Express API in front of the Playwright browser agent.
+ * Express API in front of the Playwright browser agent (multi-user).
  *
- *   GET  /health               Liveness + agent status (no auth).
- *   POST /api/agent/parse      Preview how a prompt is interpreted (no browser).
- *   POST /api/agent/run        Run a command, respond once with all logs (JSON).
- *   POST /api/agent/stream     Run a command, stream logs live (Server-Sent Events).
- *   GET  /api/agent/screencast Live browser preview: JPEG frames as SSE (base64).
- *   GET  /api/agent/session    Is the browser profile signed in to Google?
- *   POST /api/agent/plan       { prompt } -> AI plan (OpenAI): the task, with the email written for you.
+ *   GET  /health                    Liveness + server-wide status (no auth, no user data).
  *
- *   Connect / disconnect Gmail from the dashboard (the sign-in page is shown in the live preview):
- *   GET  /api/agent/login          Is a sign-in in progress?
- *   POST /api/agent/login/start    Open Google's sign-in page.
- *   POST /api/agent/login/input    { type: click, x, y (0-1) } | { type: type, text } | { type: key, key } | { type: scroll, deltaY }
- *   POST /api/agent/login/cancel   Close the sign-in page.
- *   POST /api/agent/logout         Sign the agent out of Google and forget the account.
+ *   Every /api route needs the x-api-key header (sent by the Next.js proxy). Every route
+ *   except /api/auth/login also needs "Authorization: Bearer <token>" for a signed-in user;
+ *   everything below only ever sees and changes that user's own data.
  *
- *   Runs (used by the dashboard; a run keeps going and can be re-watched after a page refresh):
- *   POST /api/agent/runs              Start a run from a (reviewed) { task, prompt? }, or from { prompt }
- *                                     alone (planned with AI first). Returns its id.
- *   GET  /api/agent/runs              Recent runs (newest first).
- *   GET  /api/agent/runs/:id          One run with its logs and report.
- *   GET  /api/agent/runs/:id/stream   SSE: replays past logs, then live logs, then the result.
+ *   Auth
+ *   POST /api/auth/login            { email, password } -> { token, user }
+ *   GET  /api/auth/me               The signed-in user.
  *
- *   Schedules (saved in data/schedules.json; see scheduler.js):
- *   GET    /api/agent/schedules        All schedules.
- *   POST   /api/agent/schedules        { task, prompt?, frequency: once|daily|weekly, time: "HH:MM", date?, weekday? }
- *   DELETE /api/agent/schedules/:id    Remove a schedule.
+ *   Admin (role "admin")
+ *   GET    /api/admin/users         All users, with Gmail status and today's usage.
+ *   POST   /api/admin/users         { email, name, password, role?, dailyEmailLimit? }
+ *   PATCH  /api/admin/users/:id     { name?, role?, disabled?, password?, dailyEmailLimit? }
+ *   DELETE /api/admin/users/:id     Removes the user, their browser profile and schedules.
  *
- * Request body for parse/run/stream: { "prompt": "Send an email to ...", "dryRun"?: boolean }
- * Auth: send the `x-api-key` header when AGENT_API_KEY is set.
+ *   Agent (the signed-in user's own browser, Gmail, runs and schedules)
+ *   POST /api/agent/plan            { prompt } -> AI plan: the task, with the email written for you.
+ *   POST /api/agent/parse           Rule-based interpretation of a prompt (no browser).
+ *   POST /api/agent/run             Run a command, respond once with all logs (JSON).
+ *   POST /api/agent/stream          Run a command, stream logs live (SSE).
+ *   GET  /api/agent/screencast      Live preview of the user's browser (SSE of JPEG frames).
+ *   GET  /api/agent/session         Is the user's agent browser signed in to Google?
+ *   GET  /api/agent/login           Is a Gmail sign-in in progress?
+ *   POST /api/agent/login/start     Open Google's sign-in page (Connect Gmail).
+ *   POST /api/agent/login/input     { type: click, x, y (0-1) } | { type: type, text } | { type: key, key } | { type: scroll, deltaY }
+ *   POST /api/agent/login/cancel    Close the sign-in page.
+ *   POST /api/agent/logout          Sign the user's agent browser out of Google.
+ *   POST /api/agent/runs            Start a run from a reviewed { task, prompt? } or from { prompt }.
+ *   GET  /api/agent/runs            The user's recent runs.
+ *   GET  /api/agent/runs/:id        One run with its logs and report.
+ *   GET  /api/agent/runs/:id/stream SSE: past logs, then live logs, then the result.
+ *   GET  /api/agent/schedules       The user's schedules.
+ *   POST /api/agent/schedules       { task, prompt?, frequency: once|daily|weekly, time: "HH:MM", date?, weekday? }
+ *   DELETE /api/agent/schedules/:id Remove one of the user's schedules.
  * ---------------------------------------------------------------------------
  */
 
@@ -51,6 +57,7 @@ const {
   cancelLogin,
   loginStatus,
   logoutGmail,
+  removeUserData,
   closeBrowser,
   getStatus,
   subscribeViewport,
@@ -59,16 +66,19 @@ const {
   CONFIG,
 } = require('./agent');
 const { planTask, createSummarizer, aiStatus } = require('./planner');
-const { startScheduler, stopScheduler, createSchedule, listSchedules, deleteSchedule } = require('./scheduler');
+const { startScheduler, stopScheduler, createSchedule, listSchedules, deleteSchedule, deleteUserSchedules } = require('./scheduler');
+const { users, usage, publicUser } = require('./db');
+const auth = require('./auth');
 
 const PORT = parseInt(process.env.PORT, 10) || 4000;
 const API_KEY = process.env.AGENT_API_KEY || '';
 const MAX_PROMPT_LENGTH = 2000;
 
 const app = express();
+app.set('trust proxy', 'loopback'); // the Next.js proxy / Caddy run on this machine
 
 // ---------------------------------------------------------------------------
-// CORS: allow the configured frontends (Next.js on Vercel / Amplify / localhost)
+// CORS: allow the configured frontends
 // ---------------------------------------------------------------------------
 
 const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:3000')
@@ -80,14 +90,14 @@ app.use(
   cors({
     origin(origin, callback) {
       // Requests without an Origin header (curl, server-to-server) are allowed;
-      // they are still protected by the API key.
+      // they are still protected by the API key and the user token.
       if (!origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
         return callback(null, true);
       }
       return callback(null, false); // Browser will block the response.
     },
-    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'x-api-key'],
+    methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'x-api-key', 'Authorization'],
     maxAge: 600,
   })
 );
@@ -95,45 +105,39 @@ app.use(
 app.use(express.json({ limit: '32kb' }));
 
 // ---------------------------------------------------------------------------
-// Middleware
+// Errors
 // ---------------------------------------------------------------------------
 
-/** Constant-time API key check. Disabled when AGENT_API_KEY is empty. */
-function requireApiKey(req, res, next) {
-  if (!API_KEY) return next();
-  const provided = Buffer.from(String(req.get('x-api-key') || ''));
-  const expected = Buffer.from(API_KEY);
-  if (provided.length === expected.length && crypto.timingSafeEqual(provided, expected)) {
-    return next();
-  }
-  return res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid or missing x-api-key header.' } });
-}
-
-/** Validates `req.body.prompt` and stores the trimmed value on `req.prompt`. */
-function validatePrompt(req, res, next) {
-  const prompt = req.body && req.body.prompt;
-  if (typeof prompt !== 'string' || !prompt.trim()) {
-    return res.status(400).json({ success: false, error: { code: 'INVALID_PROMPT', message: 'Body must include a non-empty "prompt" string.' } });
-  }
-  if (prompt.length > MAX_PROMPT_LENGTH) {
-    return res
-      .status(400)
-      .json({ success: false, error: { code: 'INVALID_PROMPT', message: `Prompt must be at most ${MAX_PROMPT_LENGTH} characters.` } });
-  }
-  req.prompt = prompt.trim();
-  next();
-}
-
-/** Maps agent error codes to HTTP status codes. */
+/** Maps error codes to HTTP status codes. */
 function statusForError(code) {
   switch (code) {
     case 'INVALID_PROMPT':
     case 'INVALID_TASK':
     case 'INVALID_SCHEDULE':
+    case 'INVALID_INPUT':
+    case 'INVALID_USER':
     case 'NEEDS_INFO':
     case 'UNSUPPORTED_TASK':
       return 400;
+    case 'UNAUTHENTICATED':
+    case 'BAD_LOGIN':
+      return 401;
+    case 'FORBIDDEN':
+      return 403;
+    case 'NOT_FOUND':
+    case 'RUN_NOT_FOUND':
+    case 'SCHEDULE_NOT_FOUND':
+    case 'USER_NOT_FOUND':
+      return 404;
+    case 'ALREADY_LOGGED_IN':
+    case 'NO_LOGIN':
+    case 'EMAIL_TAKEN':
+      return 409;
+    case 'CONTACT_NOT_FOUND':
+      return 422;
     case 'AI_RATE_LIMIT':
+    case 'DAILY_LIMIT':
+    case 'TOO_MANY_ATTEMPTS':
       return 429;
     case 'AI_AUTH':
     case 'AI_QUOTA':
@@ -141,13 +145,7 @@ function statusForError(code) {
     case 'AI_UNREACHABLE':
     case 'AI_ERROR':
       return 502; // the upstream AI service failed, not this server
-    case 'CONTACT_NOT_FOUND':
-      return 422;
-    case 'INVALID_INPUT':
-      return 400;
-    case 'ALREADY_LOGGED_IN':
-    case 'NO_LOGIN':
-      return 409;
+    case 'BROWSERS_BUSY':
     case 'LOGIN_REQUIRED':
     case 'PROFILE_IN_USE':
     case 'BROWSER_NOT_INSTALLED':
@@ -159,8 +157,79 @@ function statusForError(code) {
   }
 }
 
+const fail = (code, message) => {
+  throw new AgentError(code, message);
+};
+
+const sendError = (res, err) => {
+  const code = err instanceof AgentError ? err.code : 'UNKNOWN';
+  if (code === 'UNKNOWN') console.error('[server] Error:', err);
+  res.status(statusForError(code)).json({ success: false, error: { code, message: err.message } });
+};
+
+/** Wraps an async route so thrown errors become JSON error responses. */
+const route = (fn) => async (req, res) => {
+  try {
+    await fn(req, res);
+  } catch (err) {
+    sendError(res, err);
+  }
+};
+
 // ---------------------------------------------------------------------------
-// Routes
+// Middleware: API key (from the proxy) + signed-in user
+// ---------------------------------------------------------------------------
+
+/** Constant-time API key check. Disabled when AGENT_API_KEY is empty. */
+function requireApiKey(req, res, next) {
+  if (!API_KEY) return next();
+  const provided = Buffer.from(String(req.get('x-api-key') || ''));
+  const expected = Buffer.from(API_KEY);
+  if (provided.length === expected.length && crypto.timingSafeEqual(provided, expected)) return next();
+  return res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid or missing x-api-key header.' } });
+}
+
+/** Loads the signed-in user from "Authorization: Bearer <token>" into req.user. */
+function requireUser(req, res, next) {
+  const header = req.get('authorization') || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  const claims = auth.verifyToken(token);
+  const user = claims && users.get(claims.uid);
+  if (!user || user.disabled) {
+    return res.status(401).json({ success: false, error: { code: 'UNAUTHENTICATED', message: 'Please sign in again.' } });
+  }
+  req.user = user;
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ success: false, error: { code: 'FORBIDDEN', message: 'Only admins can do this.' } });
+  }
+  next();
+}
+
+/** Validates `req.body.prompt` and stores the trimmed value on `req.prompt`. */
+function validatePrompt(req, res, next) {
+  try {
+    req.prompt = readPrompt(req.body && req.body.prompt, true);
+    next();
+  } catch (err) {
+    sendError(res, err);
+  }
+}
+
+/** Checks an optional/required prompt string and returns it trimmed. */
+function readPrompt(prompt, required) {
+  if (prompt === undefined && !required) return undefined;
+  if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > MAX_PROMPT_LENGTH) {
+    fail('INVALID_PROMPT', `"prompt" must be 1-${MAX_PROMPT_LENGTH} characters.`);
+  }
+  return prompt.trim();
+}
+
+// ---------------------------------------------------------------------------
+// Public
 // ---------------------------------------------------------------------------
 
 app.get('/health', (req, res) => {
@@ -169,90 +238,202 @@ app.get('/health', (req, res) => {
 
 app.use('/api', requireApiKey);
 
-/** Dry interpretation of a prompt: useful for showing the user what will happen before running it. */
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
+
+app.post(
+  '/api/auth/login',
+  route(async (req, res) => {
+    const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+    const password = String((req.body && req.body.password) || '');
+    const key = `${email}|${req.ip}`;
+    if (auth.loginLimiter.blocked(key)) fail('TOO_MANY_ATTEMPTS', 'Too many failed attempts. Try again in 15 minutes.');
+    const user = email && users.getByEmail(email);
+    if (!user || !auth.verifyPassword(password, user.password_hash)) {
+      auth.loginLimiter.fail(key);
+      fail('BAD_LOGIN', 'Wrong email or password.');
+    }
+    if (user.disabled) fail('BAD_LOGIN', 'This account is disabled. Ask your admin.');
+    auth.loginLimiter.reset(key);
+    users.touchLogin(user.id);
+    res.json({ success: true, token: auth.signToken({ uid: user.id, role: user.role }), user: publicUser(user), expiresInHours: auth.SESSION_HOURS });
+  })
+);
+
+app.use('/api', requireUser);
+
+app.get('/api/auth/me', (req, res) => {
+  res.json({ success: true, user: publicUser(req.user), usage: usage.today(req.user.id) });
+});
+
+// ---------------------------------------------------------------------------
+// Admin: users
+// ---------------------------------------------------------------------------
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function readLimit(v) {
+  if (v === undefined) return undefined;
+  if (v === null || v === '') return null; // back to the default
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0 || n > 10000) fail('INVALID_USER', 'Daily email limit must be a whole number from 0 to 10000.');
+  return n;
+}
+
+app.get('/api/admin/users', requireAdmin, (req, res) => {
+  res.json({ users: users.list().map((u) => ({ ...publicUser(u), usageToday: usage.today(u.id) })) });
+});
+
+app.post(
+  '/api/admin/users',
+  requireAdmin,
+  route(async (req, res) => {
+    const { email, name, password, role = 'user', dailyEmailLimit } = req.body || {};
+    if (typeof email !== 'string' || !EMAIL_RE.test(email.trim())) fail('INVALID_USER', 'Enter a valid email address.');
+    if (typeof name !== 'string' || !name.trim() || name.length > 100) fail('INVALID_USER', 'Enter a name (up to 100 characters).');
+    const problem = auth.passwordProblem(password);
+    if (problem) fail('INVALID_USER', problem);
+    if (!['admin', 'user'].includes(role)) fail('INVALID_USER', 'Role must be admin or user.');
+    if (users.getByEmail(email)) fail('EMAIL_TAKEN', 'A user with this email already exists.');
+    const user = users.create({
+      email: email.toLowerCase(),
+      name,
+      passwordHash: auth.hashPassword(password),
+      role,
+      dailyEmailLimit: readLimit(dailyEmailLimit) ?? null,
+    });
+    res.status(201).json({ success: true, user: publicUser(user) });
+  })
+);
+
+app.patch(
+  '/api/admin/users/:id',
+  requireAdmin,
+  route(async (req, res) => {
+    const target = users.get(req.params.id);
+    if (!target) fail('USER_NOT_FOUND', 'This user no longer exists.');
+    const { name, role, disabled, password, dailyEmailLimit } = req.body || {};
+    const patch = {};
+    if (name !== undefined) {
+      if (typeof name !== 'string' || !name.trim() || name.length > 100) fail('INVALID_USER', 'Enter a name (up to 100 characters).');
+      patch.name = name.trim();
+    }
+    if (role !== undefined) {
+      if (!['admin', 'user'].includes(role)) fail('INVALID_USER', 'Role must be admin or user.');
+      if (target.id === req.user.id && role !== 'admin') fail('INVALID_USER', 'You cannot remove your own admin role.');
+      patch.role = role;
+    }
+    if (disabled !== undefined) {
+      if (target.id === req.user.id && disabled) fail('INVALID_USER', 'You cannot disable your own account.');
+      patch.disabled = disabled ? 1 : 0;
+    }
+    if (password !== undefined) {
+      const problem = auth.passwordProblem(password);
+      if (problem) fail('INVALID_USER', problem);
+      patch.password_hash = auth.hashPassword(password);
+    }
+    const limit = readLimit(dailyEmailLimit);
+    if (limit !== undefined) patch.daily_email_limit = limit;
+    const updated = users.update(target.id, patch);
+    res.json({ success: true, user: { ...publicUser(updated), usageToday: usage.today(updated.id) } });
+  })
+);
+
+app.delete(
+  '/api/admin/users/:id',
+  requireAdmin,
+  route(async (req, res) => {
+    const target = users.get(req.params.id);
+    if (!target) fail('USER_NOT_FOUND', 'This user no longer exists.');
+    if (target.id === req.user.id) fail('INVALID_USER', 'You cannot delete your own account.');
+    await removeUserData(target.id); // closes their browser, deletes their Gmail profile
+    deleteUserSchedules(target.id);
+    for (const [id, run] of runs) if (run.userId === target.id) runs.delete(id);
+    users.remove(target.id);
+    res.json({ success: true });
+  })
+);
+
+// ---------------------------------------------------------------------------
+// Daily email limit
+// ---------------------------------------------------------------------------
+
+/** Throws DAILY_LIMIT if this user may not send another email today. */
+function checkEmailLimit(user, task) {
+  if (task.type !== 'send_email' || task.sendMode === 'draft') return;
+  const limit = usage.limitFor(user);
+  if (usage.today(user.id).emails >= limit) {
+    fail('DAILY_LIMIT', `Daily limit reached: you can send ${limit} emails per day. Try again tomorrow or ask your admin.`);
+  }
+}
+
+/** Counts a finished run (and a sent email) towards the user's usage. */
+function recordUsage(userId, report) {
+  const sent = report && report.success && report.result && report.result.sent ? 1 : 0;
+  usage.add(userId, { runs: 1, emails: sent });
+}
+
+// ---------------------------------------------------------------------------
+// One-shot runs (JSON / SSE), kept for API clients
+// ---------------------------------------------------------------------------
+
 app.post('/api/agent/parse', validatePrompt, (req, res) => {
   try {
     res.json({ success: true, task: parseCommand(req.prompt) });
   } catch (err) {
-    const code = err instanceof AgentError ? err.code : 'UNKNOWN';
-    res.status(statusForError(code)).json({ success: false, error: { code, message: err.message } });
+    sendError(res, err);
   }
 });
 
-/** Runs the agent and returns the full report (task, result, step logs) in one JSON response. */
-app.post('/api/agent/run', validatePrompt, async (req, res, next) => {
-  try {
-    const report = await runBrowserAgent(req.prompt, { dryRun: req.body.dryRun === true });
+app.post(
+  '/api/agent/run',
+  validatePrompt,
+  route(async (req, res) => {
+    checkEmailLimit(req.user, parseCommand(req.prompt));
+    const report = await runBrowserAgent(req.prompt, { userId: req.user.id, dryRun: req.body.dryRun === true });
+    recordUsage(req.user.id, report);
     res.status(report.success ? 200 : statusForError(report.error.code)).json(report);
-  } catch (err) {
-    next(err);
-  }
-});
+  })
+);
 
-/**
- * Runs the agent and streams each log entry as it happens using Server-Sent Events.
- * Events:  log -> { step, time, level, message, data? }
- *          result -> final report (same shape as /api/agent/run)
- * POST is used (instead of EventSource/GET) so the prompt and API key stay out of URLs;
- * read it from the frontend with fetch() + response.body.getReader().
- */
 app.post('/api/agent/stream', validatePrompt, async (req, res) => {
-  res.status(200).set({
-    'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache, no-transform',
-    Connection: 'keep-alive',
-    'X-Accel-Buffering': 'no', // Disable proxy buffering (nginx / some PaaS).
-  });
-  res.flushHeaders();
-
-  let clientGone = false;
-  res.on('close', () => {
-    clientGone = true;
-  });
-
-  const send = (event, payload) => {
-    if (clientGone) return;
-    res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
-  };
-
-  // Comment lines keep idle connections alive through load balancers during long typing steps.
-  const heartbeat = setInterval(() => {
-    if (!clientGone) res.write(': ping\n\n');
-  }, 15000);
-
   try {
-    // The task keeps running even if the client disconnects: stopping halfway
-    // through composing an email would leave Gmail in an unknown state.
-    const report = await runBrowserAgent(req.prompt, {
-      dryRun: req.body.dryRun === true,
-      onLog: (entry) => send('log', entry),
-    });
-    send('result', report);
+    checkEmailLimit(req.user, parseCommand(req.prompt));
   } catch (err) {
-    send('result', { success: false, error: { code: 'UNKNOWN', message: err.message }, logs: [] });
+    return sendError(res, err);
+  }
+  const sse = openSse(res);
+  try {
+    // The task keeps running even if the client disconnects: stopping halfway through
+    // composing an email would leave Gmail in an unknown state.
+    const report = await runBrowserAgent(req.prompt, {
+      userId: req.user.id,
+      dryRun: req.body.dryRun === true,
+      onLog: (entry) => sse.send('log', entry),
+    });
+    recordUsage(req.user.id, report);
+    sse.send('result', report);
+  } catch (err) {
+    sse.send('result', { success: false, error: { code: 'UNKNOWN', message: err.message }, logs: [] });
   } finally {
-    clearInterval(heartbeat);
-    if (!clientGone) res.end();
+    sse.end();
   }
 });
 
+// ---------------------------------------------------------------------------
+// Live preview (only the user's own browser)
+// ---------------------------------------------------------------------------
+
 /**
- * Live browser preview. Stays open; any number of dashboards can watch.
- * Events:  state -> { active, url }        (a task started/stopped or navigated)
- *          frame -> { data, width, height, url, time }   (data = base64 JPEG)
- * On connect the viewer gets the current state and the last frame immediately.
- * Frames are rate-limited per viewer and only the newest is kept, so a slow
- * connection sees fewer frames instead of an ever-growing delay.
+ * Events: state -> { active, url } · frame -> { data, width, height, url, time } (base64 JPEG).
+ * On connect the viewer gets the current state and last frame immediately. Frames are
+ * rate-limited per viewer and only the newest is kept, so a slow connection sees fewer
+ * frames instead of an ever-growing delay.
  */
 app.get('/api/agent/screencast', (req, res) => {
-  res.status(200).set({
-    'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache, no-transform',
-    Connection: 'keep-alive',
-    'X-Accel-Buffering': 'no',
-  });
-  res.flushHeaders();
-
+  const userId = req.user.id;
+  const sse = openSse(res);
   const minIntervalMs = 1000 / Math.max(1, CONFIG.screencast.maxFps);
   let closed = false;
   let blocked = false; // socket buffer full; wait for 'drain'
@@ -260,15 +441,13 @@ app.get('/api/agent/screencast', (req, res) => {
   let lastSentAt = 0;
   let timer = null;
 
-  const write = (event, payload) => (closed ? true : res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`));
-
   const sendPending = () => {
     timer = null;
     if (closed || blocked || !pending) return;
     const frame = pending;
     pending = null;
     lastSentAt = Date.now();
-    if (!write('frame', frame)) {
+    if (!res.write(`event: frame\ndata: ${JSON.stringify(frame)}\n\n`)) {
       blocked = true;
       res.once('drain', () => {
         blocked = false;
@@ -286,39 +465,67 @@ app.get('/api/agent/screencast', (req, res) => {
     pending = frame; // older unsent frames are simply replaced
     schedule();
   };
-  const onState = (state) => write('state', state);
+  const onState = (state) => sse.send('state', state);
 
-  const { state, lastFrame } = getViewportSnapshot();
-  write('state', state);
+  const { state, lastFrame } = getViewportSnapshot(userId);
+  sse.send('state', state);
   if (lastFrame) onFrame(lastFrame);
-  const unsubscribe = subscribeViewport(onFrame, onState);
-
-  const heartbeat = setInterval(() => {
-    if (!closed) res.write(': ping\n\n');
-  }, 15000);
-
-  res.on('close', () => {
+  const unsubscribe = subscribeViewport(userId, onFrame, onState);
+  sse.onClose(() => {
     closed = true;
     clearTimeout(timer);
-    clearInterval(heartbeat);
     unsubscribe();
   });
 });
 
-/** Is the saved browser profile signed in to Google? `?refresh=1` skips the 1-minute cache. */
-app.get('/api/agent/session', async (req, res, next) => {
-  try {
-    res.json(await checkSession({ force: req.query.refresh === '1' }));
-  } catch (err) {
-    next(err);
-  }
-});
+// ---------------------------------------------------------------------------
+// Gmail connection of the user's agent browser
+// ---------------------------------------------------------------------------
+
+app.get(
+  '/api/agent/session',
+  route(async (req, res) => {
+    res.json(await checkSession(req.user.id, { force: req.query.refresh === '1' }));
+  })
+);
+
+app.get('/api/agent/login', (req, res) => res.json(loginStatus(req.user.id)));
+
+app.post(
+  '/api/agent/login/start',
+  route(async (req, res) => {
+    res.json({ success: true, login: await startLogin(req.user.id) });
+  })
+);
+
+app.post(
+  '/api/agent/login/input',
+  route(async (req, res) => {
+    await sendLoginInput(req.user.id, req.body);
+    res.json({ success: true });
+  })
+);
+
+app.post(
+  '/api/agent/login/cancel',
+  route(async (req, res) => {
+    await cancelLogin(req.user.id);
+    res.json({ success: true });
+  })
+);
+
+app.post(
+  '/api/agent/logout',
+  route(async (req, res) => {
+    res.json({ success: true, ...(await logoutGmail(req.user.id)) });
+  })
+);
 
 // ---------------------------------------------------------------------------
 // Runs: start a task on one page, watch it on another (refresh-safe)
 // ---------------------------------------------------------------------------
 
-const MAX_RUNS = 50; // kept in memory; lost when the server restarts
+const MAX_RUNS = 500; // all users together; kept in memory, lost when the server restarts
 const RUN_TTL_MS = 60 * 60 * 1000;
 const runs = new Map(); // id -> run (Map keeps insertion order: oldest first)
 
@@ -346,14 +553,23 @@ function pruneRuns() {
   }
 }
 
-/** Starts a run of an already validated task in the background and returns it immediately. */
-function startRun({ task, prompt, dryRun, scheduled = false }) {
+/**
+ * Starts a run of an already validated task for a user, in the background, and returns it
+ * immediately. Throws DAILY_LIMIT when the user may not send another email today.
+ */
+function startRun({ userId, task, prompt, dryRun, scheduled = false }) {
+  const user = users.get(userId);
+  if (!user || user.disabled) fail('UNAUTHENTICATED', 'Unknown or disabled user.');
+  const effectiveTask = dryRun && task.type === 'send_email' ? { ...task, sendMode: 'draft' } : task;
+  checkEmailLimit(user, effectiveTask);
+
   const run = {
     id: crypto.randomUUID(),
+    userId,
     scheduled,
     source: prompt ? 'prompt' : 'form',
     prompt, // the user's original words, kept for display and for the AI summary
-    task: dryRun && task.type === 'send_email' ? { ...task, sendMode: 'draft' } : task,
+    task: effectiveTask,
     status: 'running',
     logs: [],
     report: null,
@@ -368,10 +584,12 @@ function startRun({ task, prompt, dryRun, scheduled = false }) {
     run.report = report;
     if (report.task) run.task = report.task;
     run.status = report.success ? 'success' : 'error';
+    recordUsage(userId, report);
     run.events.emit('done', report);
   };
 
-  runBrowserAgent(task, {
+  runBrowserAgent(effectiveTask, {
+    userId,
     dryRun,
     postProcess: createSummarizer(prompt), // AI summary of search/inbox results (no-op when AI is off)
     onLog: (entry) => {
@@ -415,43 +633,27 @@ function openSse(res) {
   };
 }
 
-const sendError = (res, err) => {
-  const code = err instanceof AgentError ? err.code : 'UNKNOWN';
-  res.status(statusForError(code)).json({ success: false, error: { code, message: err.message } });
-};
-
-/** Checks an optional/required prompt string and returns it trimmed. */
-function readPrompt(prompt, required) {
-  if (prompt === undefined && !required) return undefined;
-  if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > MAX_PROMPT_LENGTH) {
-    throw new AgentError('INVALID_PROMPT', `"prompt" must be 1-${MAX_PROMPT_LENGTH} characters.`);
-  }
-  return prompt.trim();
-}
-
 /**
- * Plan with AI: { prompt } -> { ai, model, task, summary }. Nothing runs yet, so the
- * dashboard can show the AI-written email for the user to check and edit first.
- * Without OPENAI_API_KEY this uses the rule-based parser (ai: false).
+ * Plan with AI: { prompt } -> { ai, model, task, summary }. Nothing runs yet. The email is
+ * signed with this user's name. Without OPENAI_API_KEY the rule-based parser is used.
  */
-app.post('/api/agent/plan', async (req, res) => {
-  try {
+app.post(
+  '/api/agent/plan',
+  route(async (req, res) => {
     const prompt = readPrompt(req.body && req.body.prompt, true);
-    res.json({ success: true, ...(await planTask(prompt)) });
-  } catch (err) {
-    sendError(res, err);
-  }
-});
+    res.json({ success: true, ...(await planTask(prompt, req.user.id)) });
+  })
+);
 
 /**
  * Start a run. Body (plus optional dryRun):
  *   { task: {...}, prompt?: "original words" }   run this exact (e.g. reviewed) task
  *   { prompt: "..." }                            plan with AI first, then run
- * Input is checked here, so mistakes come back as 4xx before any browser work.
  */
-app.post('/api/agent/runs', async (req, res) => {
-  const { prompt: promptInput, task: taskInput, dryRun } = req.body || {};
-  try {
+app.post(
+  '/api/agent/runs',
+  route(async (req, res) => {
+    const { prompt: promptInput, task: taskInput, dryRun } = req.body || {};
     let task;
     let prompt;
     if (taskInput !== undefined) {
@@ -459,85 +661,26 @@ app.post('/api/agent/runs', async (req, res) => {
       prompt = readPrompt(promptInput, false);
     } else {
       prompt = readPrompt(promptInput, true);
-      task = (await planTask(prompt)).task;
+      task = (await planTask(prompt, req.user.id)).task;
     }
-    const run = startRun({ task, prompt, dryRun: dryRun === true });
+    const run = startRun({ userId: req.user.id, task, prompt, dryRun: dryRun === true });
     res.status(202).json({ success: true, run: runSummary(run) });
-  } catch (err) {
-    sendError(res, err);
-  }
-});
-
-// ---------------------------------------------------------------------------
-// Connect / disconnect Gmail
-// ---------------------------------------------------------------------------
-
-app.get('/api/agent/login', (req, res) => {
-  res.json(loginStatus());
-});
-
-app.post('/api/agent/login/start', async (req, res) => {
-  try {
-    res.json({ success: true, login: await startLogin() });
-  } catch (err) {
-    sendError(res, err);
-  }
-});
-
-app.post('/api/agent/login/input', async (req, res) => {
-  try {
-    await sendLoginInput(req.body);
-    res.json({ success: true });
-  } catch (err) {
-    sendError(res, err);
-  }
-});
-
-app.post('/api/agent/login/cancel', async (req, res) => {
-  await cancelLogin();
-  res.json({ success: true });
-});
-
-app.post('/api/agent/logout', async (req, res) => {
-  try {
-    res.json({ success: true, ...(await logoutGmail()) });
-  } catch (err) {
-    sendError(res, err);
-  }
-});
-
-// ---------------------------------------------------------------------------
-// Schedules
-// ---------------------------------------------------------------------------
-
-app.get('/api/agent/schedules', (req, res) => {
-  res.json({ schedules: listSchedules() });
-});
-
-app.post('/api/agent/schedules', (req, res) => {
-  try {
-    res.status(201).json({ success: true, schedule: createSchedule(req.body) });
-  } catch (err) {
-    sendError(res, err);
-  }
-});
-
-app.delete('/api/agent/schedules/:id', (req, res) => {
-  if (deleteSchedule(req.params.id)) return res.json({ success: true });
-  res.status(404).json({ success: false, error: { code: 'SCHEDULE_NOT_FOUND', message: 'This schedule no longer exists.' } });
-});
+  })
+);
 
 app.get('/api/agent/runs', (req, res) => {
-  res.json({ runs: [...runs.values()].reverse().map(runSummary) });
+  res.json({ runs: [...runs.values()].filter((r) => r.userId === req.user.id).reverse().map(runSummary) });
 });
 
+/** The run, if it exists and belongs to the signed-in user (otherwise a 404, never someone else's run). */
 function findRun(req, res) {
   const run = runs.get(req.params.id);
-  if (!run) {
+  if (!run || run.userId !== req.user.id) {
     res.status(404).json({
       success: false,
       error: { code: 'RUN_NOT_FOUND', message: 'This run does not exist (runs are forgotten after a server restart or 1 hour).' },
     });
+    return null;
   }
   return run;
 }
@@ -547,10 +690,7 @@ app.get('/api/agent/runs/:id', (req, res) => {
   if (run) res.json({ run: { ...runSummary(run), logs: run.logs, report: run.report } });
 });
 
-/**
- * Watch a run. Events: run (summary), log (each step; past ones replayed first), result (final report).
- * The stream ends after "result", so a page refresh simply replays everything.
- */
+/** Events: run (summary), log (past ones replayed first, then live), result (final report). */
 app.get('/api/agent/runs/:id/stream', (req, res) => {
   const run = findRun(req, res);
   if (!run) return;
@@ -575,6 +715,30 @@ app.get('/api/agent/runs/:id/stream', (req, res) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Schedules (the user's own)
+// ---------------------------------------------------------------------------
+
+app.get('/api/agent/schedules', (req, res) => {
+  res.json({ schedules: listSchedules(req.user.id) });
+});
+
+app.post(
+  '/api/agent/schedules',
+  route(async (req, res) => {
+    res.status(201).json({ success: true, schedule: createSchedule(req.body, req.user.id) });
+  })
+);
+
+app.delete('/api/agent/schedules/:id', (req, res) => {
+  if (deleteSchedule(req.params.id, req.user.id)) return res.json({ success: true });
+  res.status(404).json({ success: false, error: { code: 'SCHEDULE_NOT_FOUND', message: 'This schedule no longer exists.' } });
+});
+
+// ---------------------------------------------------------------------------
+// Fallbacks
+// ---------------------------------------------------------------------------
+
 app.use((req, res) => {
   res.status(404).json({ success: false, error: { code: 'NOT_FOUND', message: `No route for ${req.method} ${req.path}` } });
 });
@@ -595,8 +759,9 @@ app.use((err, req, res, next) => {
 
 const server = app.listen(PORT, () => {
   console.log(`[server] AI Browser Agent listening on http://localhost:${PORT}`);
-  console.log(`[server] Allowed origins: ${allowedOrigins.join(', ')}`);
-  if (!API_KEY) console.warn('[server] WARNING: AGENT_API_KEY is empty, so the API is unauthenticated. Set it before exposing this server.');
+  console.log(`[server] Up to ${CONFIG.maxBrowsers} browsers at once; idle ones close after ${CONFIG.idleCloseMs / 60000} min`);
+  if (!API_KEY) console.warn('[server] WARNING: AGENT_API_KEY is empty. Set it before exposing this server.');
+  if (users.count() === 0) console.warn('[server] No users yet. Create the first admin: npm run add-user -- --admin');
   startScheduler(startRun); // runs scheduled tasks when they're due
 });
 

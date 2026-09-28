@@ -22,6 +22,7 @@ const path = require('path');
 const { EventEmitter } = require('events');
 const crypto = require('crypto');
 const { chromium, errors: playwrightErrors } = require('playwright');
+const { users: userStore } = require('./db');
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -36,7 +37,12 @@ const envInt = (value, fallback) => {
 
 const CONFIG = {
   headless: envBool(process.env.HEADLESS, true),
-  userDataDir: path.resolve(process.env.USER_DATA_DIR || './.browser-profile'),
+  // Multi-user: each user gets their own browser profile folder under PROFILES_DIR.
+  profilesDir: path.resolve(process.env.PROFILES_DIR || './data/profiles'),
+  maxBrowsers: Math.max(1, envInt(process.env.MAX_BROWSERS, 10)), // browsers open at the same time
+  idleCloseMs: Math.max(1, envInt(process.env.BROWSER_IDLE_MINUTES, 5)) * 60 * 1000, // close an unused browser after this
+  // The single-user profile from before multi-user mode (moved to the first admin; see scripts/add-user.js).
+  legacyProfileDir: path.resolve(process.env.USER_DATA_DIR || './.browser-profile'),
   channel: process.env.BROWSER_CHANNEL || undefined, // e.g. "chrome" to use installed Google Chrome
   typingDelayMs: envInt(process.env.TYPING_DELAY_MS, 80),
   slowMoMs: envInt(process.env.SLOW_MO_MS, 0),
@@ -391,7 +397,7 @@ function tidy(text) {
 
 /**
  * Writes a complete email around the user's words: greeting, a friendly opener, the message,
- * helpful next steps for this kind of email, a closing line and the sign-off (+ SENDER_NAME).
+ * helpful next steps for this kind of email, a closing line and the sign-off.
  * content: { message } the user's own words (kept as a sentence), { said } what to tell them
  * ("that …"), { topic } what it is about, or { subject } only.
  */
@@ -421,7 +427,7 @@ function composeBody(recipients, content) {
     ? intent.lines
     : ['Could we find some time to discuss this? Please let me know what works best for you.'];
 
-  const sender = senderName();
+  const sender = ''; // the user's name is added under "Best regards," at run time (signBody)
   return [
     name ? `Hi ${name},` : 'Hello,',
     'I hope you are doing well.',
@@ -593,12 +599,45 @@ function validateTask(input) {
 }
 
 // ---------------------------------------------------------------------------
-// Browser lifecycle (single shared persistent context + task queue)
+// Browsers: one per user, at most CONFIG.maxBrowsers open at the same time
 // ---------------------------------------------------------------------------
+//
+// Each user has a "session": their own Chrome profile folder (Gmail login), task queue,
+// sign-in state and live preview. A browser is opened for a user when they need it and
+// closed again after CONFIG.idleCloseMs without use.
+//
+// The pool allows CONFIG.maxBrowsers open browsers. When it is full and another user
+// needs one: an idle browser (no task, no sign-in) is closed to make room; if every
+// browser is busy, the user waits in line and gets the next browser that frees up.
 
-let contextPromise = null;
-let taskQueue = Promise.resolve();
-let pendingTasks = 0;
+const sessions = new Map(); // userId -> session
+const pool = { open: new Set(), waiters: [] }; // userIds with an open (or opening) browser; FIFO line
+
+const USER_ID_RE = /^[0-9a-f-]{36}$/i;
+
+/** The user's session (created on first use). */
+function userSession(userId) {
+  if (!USER_ID_RE.test(String(userId || ''))) throw new AgentError('NO_USER', 'Unknown user.');
+  let s = sessions.get(userId);
+  if (!s) {
+    s = {
+      userId,
+      profileDir: path.join(CONFIG.profilesDir, userId),
+      contextPromise: null,
+      queue: Promise.resolve(),
+      pending: 0, // tasks queued or running (a sign-in counts as one)
+      lastUsed: Date.now(),
+      idleTimer: null,
+      login: null, // sign-in in progress (Connect Gmail)
+      lastLoginResult: null,
+      sessionCache: null, // { result, at } of the last Gmail login check
+      accountLookup: null,
+      viewport: { state: { active: false, url: null }, lastFrame: null },
+    };
+    sessions.set(userId, s);
+  }
+  return s;
+}
 
 /** Launch options shared by the agent and the interactive login helper. */
 function launchOptions(overrides = {}) {
@@ -625,88 +664,172 @@ function launchOptions(overrides = {}) {
   };
 }
 
+const isIdle = (s) => s.pending === 0 && !s.login;
+
+/** Wakes the first user waiting in line, so they can take a freed (or now idle) browser. */
+function wakeOneWaiter() {
+  const next = pool.waiters.shift();
+  if (next) next();
+}
+
+/** True when the user has a browser, or one can be opened now (free slot or an idle browser to close). */
+function canOpenBrowser(s) {
+  if (s.contextPromise || pool.open.has(s.userId) || pool.open.size < CONFIG.maxBrowsers) return true;
+  return [...pool.open].some((id) => {
+    const x = sessions.get(id);
+    return x && x !== s && isIdle(x);
+  });
+}
+
+/** Reserves a browser for the user: free slot → take it; full → close an idle one; all busy → wait. */
+async function acquireBrowserSlot(s, log) {
+  if (pool.open.has(s.userId)) return;
+  let announced = false;
+  for (;;) {
+    if (pool.open.size < CONFIG.maxBrowsers) {
+      pool.open.add(s.userId);
+      return;
+    }
+    const idle = [...pool.open]
+      .map((id) => sessions.get(id))
+      .filter((x) => x && x !== s && isIdle(x))
+      .sort((a, b) => a.lastUsed - b.lastUsed)[0];
+    if (idle) {
+      await closeUserBrowser(idle);
+      continue;
+    }
+    if (!announced) {
+      log.info(`All ${CONFIG.maxBrowsers} browsers are busy. Waiting for a free one (${pool.waiters.length + 1} in line)…`);
+      announced = true;
+      await new Promise((resolve) => pool.waiters.push(resolve));
+    } else {
+      // Woken, but someone else was faster: keep the place at the front of the line.
+      await new Promise((resolve) => pool.waiters.unshift(resolve));
+    }
+  }
+}
+
+function releaseBrowserSlot(userId) {
+  if (pool.open.delete(userId)) wakeOneWaiter();
+}
+
+function launchError(err) {
+  if (/ProcessSingleton|already in use|SingletonLock/i.test(err.message)) {
+    return new AgentError('PROFILE_IN_USE', 'This browser profile is already in use (for example by `npm run login`). Close it and retry.');
+  }
+  if (/Executable doesn't exist|npx playwright install/i.test(err.message)) {
+    return new AgentError('BROWSER_NOT_INSTALLED', 'Chromium is not installed. Run: npx playwright install chromium');
+  }
+  return new AgentError('BROWSER_LAUNCH_FAILED', `Failed to launch browser: ${err.message}`);
+}
+
 /**
- * Returns the shared persistent browser context, launching it on first use.
- * A persistent context stores cookies in USER_DATA_DIR, so once you've signed
- * in to Gmail (see `npm run login`) you stay signed in across restarts.
+ * The user's browser, opened on first use (waiting for a free slot if needed). A persistent
+ * context keeps the cookies in the user's profile folder, so their Gmail stays signed in.
  */
-async function getContext(log) {
-  if (!contextPromise) {
-    contextPromise = (async () => {
-      fs.mkdirSync(CONFIG.userDataDir, { recursive: true });
-      log.action(`Launching Chromium (${CONFIG.headless ? 'headless' : 'headed'}) with profile ${CONFIG.userDataDir}`);
+async function getContext(s, log) {
+  clearTimeout(s.idleTimer);
+  if (!s.contextPromise) {
+    const promise = (s.contextPromise = (async () => {
+      await acquireBrowserSlot(s, log);
       try {
-        const context = await chromium.launchPersistentContext(CONFIG.userDataDir, launchOptions());
+        fs.mkdirSync(s.profileDir, { recursive: true });
+        log.action(`Opening your browser (${CONFIG.headless ? 'headless' : 'headed'})`);
+        const context = await chromium.launchPersistentContext(s.profileDir, launchOptions());
         context.setDefaultTimeout(CONFIG.actionTimeoutMs);
-        // If the user closes the window (headed mode) or Chromium crashes, relaunch next time.
+        // Closed by us (idle / shutdown) or crashed: free the slot, relaunch next time.
         context.on('close', () => {
-          contextPromise = null;
+          if (s.contextPromise !== promise) return; // already replaced by closeUserBrowser()
+          s.contextPromise = null;
+          releaseBrowserSlot(s.userId);
         });
         return context;
       } catch (err) {
-        if (/ProcessSingleton|already in use|SingletonLock/i.test(err.message)) {
-          throw new AgentError(
-            'PROFILE_IN_USE',
-            'The browser profile is already in use. Close any other browser (e.g. `npm run login`) that uses USER_DATA_DIR and retry.'
-          );
-        }
-        if (/Executable doesn't exist|npx playwright install/i.test(err.message)) {
-          throw new AgentError('BROWSER_NOT_INSTALLED', 'Chromium is not installed. Run: npx playwright install chromium');
-        }
-        throw new AgentError('BROWSER_LAUNCH_FAILED', `Failed to launch browser: ${err.message}`);
+        releaseBrowserSlot(s.userId);
+        throw launchError(err);
       }
     })().catch((err) => {
-      contextPromise = null;
+      if (s.contextPromise === promise) s.contextPromise = null;
       throw err;
-    });
+    }));
   }
-  return contextPromise;
+  return s.contextPromise;
 }
 
-/** Closes the shared browser (used on server shutdown). */
-async function closeBrowser() {
-  if (!contextPromise) return;
-  try {
-    const context = await contextPromise;
-    await context.close();
-  } catch {
-    // Already closed or never launched.
-  } finally {
-    contextPromise = null;
+async function closeUserBrowser(s) {
+  clearTimeout(s.idleTimer);
+  const p = s.contextPromise;
+  s.contextPromise = null;
+  if (p) {
+    try {
+      await (await p).close();
+    } catch {
+      // Already closed or never opened.
+    }
   }
+  releaseBrowserSlot(s.userId);
+}
+
+/** Closes every browser (server shutdown). */
+async function closeBrowser() {
+  await Promise.all([...sessions.values()].map(closeUserBrowser));
+}
+
+function scheduleIdleClose(s) {
+  clearTimeout(s.idleTimer);
+  if (!s.contextPromise) return;
+  s.idleTimer = setTimeout(() => {
+    if (isIdle(s)) closeUserBrowser(s);
+  }, CONFIG.idleCloseMs);
 }
 
 /**
- * Runs `fn` after all previously queued tasks finish. A persistent profile can
- * only be driven by one browser at a time, and two tasks typing into Gmail at
- * once would interfere, so tasks are serialised.
+ * Runs `fn` after the user's earlier tasks finish. One browser per user, and two tasks
+ * typing into the same Gmail at once would interfere, so a user's tasks run one by one.
+ * Different users run in parallel (up to the pool size).
  */
-function enqueue(fn) {
-  pendingTasks++;
-  const run = taskQueue.then(fn, fn).finally(() => {
-    pendingTasks--;
+function enqueue(s, fn) {
+  s.pending++;
+  clearTimeout(s.idleTimer);
+  const run = s.queue.then(fn, fn).finally(() => {
+    s.pending--;
+    s.lastUsed = Date.now();
+    if (isIdle(s)) {
+      scheduleIdleClose(s);
+      wakeOneWaiter(); // someone waiting may now take this idle browser
+    }
   });
-  taskQueue = run.catch(() => {});
+  s.queue = run.catch(() => {});
   return run;
 }
 
-// ---------------------------------------------------------------------------
-// The signed-in Gmail account (name + address), used to sign emails automatically
-// ---------------------------------------------------------------------------
-
-const ACCOUNT_FILE = path.resolve(process.env.ACCOUNT_FILE || './data/account.json');
-let account = null; // { name, email, updatedAt }
-try {
-  account = JSON.parse(fs.readFileSync(ACCOUNT_FILE, 'utf8'));
-} catch {
-  account = null;
+/** Deletes everything the agent keeps for a user (used when an admin removes the user). */
+async function removeUserData(userId) {
+  const s = sessions.get(userId);
+  if (s) {
+    if (s.login) await endLogin(s, 'cancelled');
+    await closeUserBrowser(s);
+    sessions.delete(userId);
+  }
+  if (USER_ID_RE.test(userId)) fs.rmSync(path.join(CONFIG.profilesDir, userId), { recursive: true, force: true });
 }
 
-/** The signed-in Gmail account, or null if not known yet. */
-const getAccount = () => account;
+// ---------------------------------------------------------------------------
+// The user's Gmail account (name + address), used to sign their emails
+// ---------------------------------------------------------------------------
 
-/** Name used under "Best regards,": SENDER_NAME from .env wins, else the Gmail account's name. */
-const senderName = () => (process.env.SENDER_NAME || '').trim() || (account && account.name) || '';
+/** The user's Gmail account, or null if not known yet. */
+function getAccount(userId) {
+  const u = userStore.get(userId);
+  return u && u.gmail_email ? { name: u.gmail_name, email: u.gmail_email } : null;
+}
+
+/** Name under "Best regards,": the Gmail account's name (or the user's name as a fallback). */
+function senderName(userId) {
+  const u = userId && userStore.get(userId);
+  if (!u) return '';
+  return (u.gmail_name || u.name || '').trim();
+}
 
 /** "kunj dhakad" -> "Kunj Dhakad" (names typed all lowercase); other names are kept as they are. */
 const tidyName = (n) => (n === n.toLowerCase() ? n.replace(/\b[a-z]/g, (c) => c.toUpperCase()) : n);
@@ -716,19 +839,14 @@ const tidyName = (n) => (n === n.toLowerCase() ? n.replace(/\b[a-z]/g, (c) => c.
  * "Google Account: Kunj Dhakad (kunj@gmail.com)" (the words vary with the Gmail language,
  * the "Name (address)" part doesn't). Never throws; a miss just keeps the old value.
  */
-async function readAccount(page) {
+async function readAccount(page, s) {
   try {
     const label = await page
       .locator('a[aria-label*="@"][href*="accounts.google.com"]')
       .first()
       .getAttribute('aria-label', { timeout: 4000 });
     const m = label && label.match(/:\s*([^\n(]+?)\s*\(\s*([^()\s]+@[^()\s]+)\s*\)/);
-    if (!m) return;
-    const found = { name: tidyName(m[1].trim()), email: m[2].trim() };
-    if (account && account.name === found.name && account.email === found.email) return;
-    account = { ...found, updatedAt: new Date().toISOString() };
-    fs.mkdirSync(path.dirname(ACCOUNT_FILE), { recursive: true });
-    fs.writeFileSync(ACCOUNT_FILE, JSON.stringify(account, null, 2));
+    if (m) userStore.setGmailAccount(s.userId, tidyName(m[1].trim()), m[2].trim());
   } catch {
     // Profile button not found (layout change / not loaded): keep what we have.
   }
@@ -748,84 +866,97 @@ function signBody(body, name) {
   return `${lines.join('\n')}\n${name}`;
 }
 
-let accountLookup = null;
-/** One-time background lookup of the account name (opens Gmail briefly, queued behind any task). */
-function lookupAccountInBackground() {
-  if (account || accountLookup) return;
-  accountLookup = enqueue(async () => {
+/** One-time background lookup of the account name (opens Gmail briefly, queued behind the user's tasks). */
+function lookupAccountInBackground(s) {
+  if (getAccount(s.userId) || s.accountLookup) return;
+  s.accountLookup = enqueue(s, async () => {
     let page;
     try {
-      const context = await getContext(createLogger());
+      const context = await getContext(s, createLogger());
       page = await openPage(context);
       await page.goto(GMAIL_URL, { waitUntil: 'domcontentloaded' });
       await page.locator(SELECTORS.composeButton).first().waitFor({ state: 'visible', timeout: 30_000 });
-      await readAccount(page);
+      await readAccount(page, s);
     } catch {
       // Not logged in or slow: try again on the next check.
     } finally {
       if (page && !page.isClosed()) await page.close().catch(() => {});
-      accountLookup = null;
+      s.accountLookup = null;
     }
   });
 }
 
-let sessionCache = null; // { result, at }
 const SESSION_CACHE_MS = 60_000;
 
 /**
- * Tells the dashboard whether the saved browser profile is signed in to Google,
- * by looking for Google's session cookies (no page is opened). Cached for a minute.
- * Returns { loggedIn: true|false|null, reason?, checkedAt, account? }.
+ * Is the user's agent browser signed in to Google? Returns
+ * { loggedIn: true|false|null, reason?, message?, checkedAt, account?, signature? }.
  */
-async function checkSession(options) {
-  const result = await checkLogin(options);
-  if (result.loggedIn && !account) lookupAccountInBackground();
-  return {
-    ...result,
-    ...(result.loggedIn && account ? { account: { name: account.name, email: account.email } } : {}),
-    ...(result.loggedIn && senderName() ? { signature: senderName() } : {}), // name under "Best regards,"
-  };
+async function checkSession(userId, options) {
+  const s = userSession(userId);
+  const result = await checkLogin(s, options);
+  if (result.loggedIn && !getAccount(userId)) lookupAccountInBackground(s);
+  const account = result.loggedIn ? getAccount(userId) : null;
+  const signature = result.loggedIn ? senderName(userId) : '';
+  return { ...result, ...(account ? { account } : {}), ...(signature ? { signature } : {}) };
 }
 
-async function checkLogin({ force = false } = {}) {
-  if (!force && sessionCache && Date.now() - sessionCache.at < SESSION_CACHE_MS) return sessionCache.result;
+/**
+ * Reads Google's session cookies when the user's browser is open. When it isn't, it avoids
+ * taking one of the shared browsers just to look: a new user has no profile yet (not signed
+ * in), otherwise the last known state is used, and only if unknown (and a browser is free)
+ * the browser is opened to check.
+ */
+async function checkLogin(s, { force = false } = {}) {
+  if (!force && s.sessionCache && Date.now() - s.sessionCache.at < SESSION_CACHE_MS) return s.sessionCache.result;
+  const now = new Date().toISOString();
+  const stored = (userStore.get(s.userId) || {}).gmail_status || 'unknown';
   let result;
   try {
-    const context = await getContext(createLogger());
-    const cookies = await context.cookies('https://mail.google.com');
-    const loggedIn = cookies.some((c) => /^(SID|__Secure-1PSID|__Secure-3PSID)$/.test(c.name));
-    result = { loggedIn, checkedAt: new Date().toISOString() };
+    if (!s.contextPromise && !fs.existsSync(s.profileDir)) {
+      result = { loggedIn: false, checkedAt: now };
+    } else if (!s.contextPromise && stored !== 'unknown' && !force) {
+      result = { loggedIn: stored === 'connected', checkedAt: now };
+    } else if (!canOpenBrowser(s)) {
+      result = {
+        loggedIn: stored === 'connected' ? true : stored === 'disconnected' ? false : null,
+        reason: 'BROWSERS_BUSY',
+        message: 'All browsers are busy right now. Try again in a moment.',
+        checkedAt: now,
+      };
+    } else {
+      const context = await getContext(s, createLogger());
+      const cookies = await context.cookies('https://mail.google.com');
+      result = { loggedIn: cookies.some((c) => /^(SID|__Secure-1PSID|__Secure-3PSID)$/.test(c.name)), checkedAt: now };
+      if (isIdle(s)) scheduleIdleClose(s);
+    }
   } catch (err) {
-    result = {
-      loggedIn: null,
-      reason: err instanceof AgentError ? err.code : 'UNKNOWN',
-      message: err.message,
-      checkedAt: new Date().toISOString(),
-    };
+    result = { loggedIn: null, reason: err instanceof AgentError ? err.code : 'UNKNOWN', message: err.message, checkedAt: now };
   }
-  sessionCache = { result, at: Date.now() };
+  if (result.loggedIn === true) userStore.setGmailStatus(s.userId, 'connected');
+  if (result.loggedIn === false) userStore.setGmailStatus(s.userId, 'disconnected');
+  s.sessionCache = { result, at: Date.now() };
   return result;
 }
 
 // ---------------------------------------------------------------------------
-// Connect / disconnect Gmail from the dashboard
+// Connect / disconnect Gmail from the dashboard (per user)
 // ---------------------------------------------------------------------------
 //
-// "Connect Gmail" opens Google's sign-in page in the agent's own browser and streams it to
-// the dashboard (the normal live preview). The user's clicks and keys are sent back with
-// sendLoginInput(), so they sign in from any browser, with no VNC or `npm run login` needed.
-// While a sign-in is open it holds the task queue, so no task touches the browser meanwhile.
+// "Connect Gmail" opens Google's sign-in page in the user's own agent browser and streams it
+// to their dashboard (the live preview). Their clicks and keys are sent back with
+// sendLoginInput(), so they sign in from any device, with no VNC needed. While a sign-in is
+// open it holds the user's task queue, so none of their tasks touch the browser meanwhile.
 
 const LOGIN_URL = 'https://accounts.google.com/ServiceLogin?service=mail&continue=https%3A%2F%2Fmail.google.com%2Fmail%2F';
 const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
 const LOGIN_KEYS = new Set(['Enter', 'Tab', 'Backspace', 'Delete', 'Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'Space']);
 
-let login = null; // the sign-in in progress: { id, page, stopScreencast, release, watcher, timer, startedAt }
-let lastLoginResult = null; // { reason: 'success' | 'cancelled' | 'timeout' | 'closed', at }
-
-function loginStatus() {
-  if (!login) return { active: false, ...(lastLoginResult ? { lastResult: lastLoginResult } : {}) };
-  return { active: true, id: login.id, startedAt: login.startedAt, url: login.page.isClosed() ? null : login.page.url() };
+function loginStatus(userId) {
+  const s = userSession(userId);
+  if (!s.login) return { active: false, ...(s.lastLoginResult ? { lastResult: s.lastLoginResult } : {}) };
+  const l = s.login;
+  return { active: true, id: l.id, startedAt: l.startedAt, url: l.page.isClosed() ? null : l.page.url() };
 }
 
 /**
@@ -868,10 +999,14 @@ async function openPage(context) {
   return page;
 }
 
-/** Opens Google's sign-in page for the user to fill in through the dashboard. */
-async function startLogin() {
-  if (login) return loginStatus();
-  const current = await checkLogin({ force: true });
+/** Opens Google's sign-in page in the user's browser, for them to fill in through the dashboard. */
+async function startLogin(userId) {
+  const s = userSession(userId);
+  if (s.login) return loginStatus(userId);
+  if (!canOpenBrowser(s)) {
+    throw new AgentError('BROWSERS_BUSY', `All ${CONFIG.maxBrowsers} browsers are busy right now. Try again in a minute.`);
+  }
+  const current = await checkLogin(s, { force: true });
   if (current.loggedIn) {
     throw new AgentError('ALREADY_LOGGED_IN', 'Gmail is already connected. Log out first to connect a different account.');
   }
@@ -881,40 +1016,41 @@ async function startLogin() {
     release = resolve;
   });
   const opened = new Promise((resolve, reject) => {
-    enqueue(async () => {
+    enqueue(s, async () => {
       try {
         const log = createLogger();
-        const context = await getContext(log);
+        const context = await getContext(s, log);
         const page = await openPage(context);
-        const stopScreencast = await startScreencast(page, log);
+        const stopScreencast = await startScreencast(page, log, s);
         await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded' });
-        login = { id: crypto.randomUUID(), page, stopScreencast, release, startedAt: new Date().toISOString() };
-        login.watcher = setInterval(checkLoginDone, 1500);
-        login.timer = setTimeout(() => endLogin('timeout'), LOGIN_TIMEOUT_MS);
-        page.on('close', () => endLogin('closed'));
+        s.login = { id: crypto.randomUUID(), page, stopScreencast, release, startedAt: new Date().toISOString() };
+        s.login.watcher = setInterval(() => checkLoginDone(s), 1500);
+        s.login.timer = setTimeout(() => endLogin(s, 'timeout'), LOGIN_TIMEOUT_MS);
+        page.on('close', () => endLogin(s, 'closed'));
         resolve();
       } catch (err) {
         release();
         reject(err instanceof AgentError ? err : new AgentError('LOGIN_FAILED', `Could not open the Google sign-in page: ${err.message}`));
       }
-      await held; // keep the queue until the sign-in ends
+      await held; // keep the user's queue until the sign-in ends
     });
   });
   await opened;
-  return loginStatus();
+  return loginStatus(userId);
 }
 
 /** Finishes the sign-in automatically once Gmail's inbox has loaded. */
-async function checkLoginDone() {
-  const l = login;
+async function checkLoginDone(s) {
+  const l = s.login;
   if (!l || l.checking || l.page.isClosed()) return;
   l.checking = true;
   try {
     if (/^https:\/\/mail\.google\.com\/mail\//.test(l.page.url())) {
       const inbox = await l.page.locator(SELECTORS.composeButton).first().isVisible().catch(() => false);
-      if (inbox && login === l) {
-        await readAccount(l.page);
-        await endLogin('success');
+      if (inbox && s.login === l) {
+        userStore.setGmailStatus(s.userId, 'connected');
+        await readAccount(l.page, s);
+        await endLogin(s, 'success');
       }
     }
   } finally {
@@ -922,29 +1058,30 @@ async function checkLoginDone() {
   }
 }
 
-async function endLogin(reason) {
-  const l = login;
+async function endLogin(s, reason) {
+  const l = s.login;
   if (!l) return;
-  login = null;
+  s.login = null;
   clearInterval(l.watcher);
   clearTimeout(l.timer);
   await l.stopScreencast().catch(() => {});
   if (!l.page.isClosed()) await l.page.close().catch(() => {});
-  sessionCache = null; // next check re-reads the cookies
-  lastLoginResult = { reason, at: new Date().toISOString() };
+  s.sessionCache = null; // next check re-reads the cookies
+  s.lastLoginResult = { reason, at: new Date().toISOString() };
   l.release();
 }
 
-const cancelLogin = () => endLogin('cancelled');
+const cancelLogin = (userId) => endLogin(userSession(userId), 'cancelled');
 
 const clamp = (n, min, max) => Math.min(max, Math.max(min, n));
 
 /**
- * A click / key / text / scroll from the dashboard, applied to the sign-in page.
+ * A click / key / text / scroll from the dashboard, applied to the user's sign-in page.
  * Click positions are fractions (0-1) of the picture, so they don't depend on screen size.
  */
-async function sendLoginInput(input) {
-  const l = login;
+async function sendLoginInput(userId, input) {
+  const s = userSession(userId);
+  const l = s.login;
   if (!l || l.page.isClosed()) throw new AgentError('NO_LOGIN', 'No Gmail sign-in is in progress.');
   const bad = (m) => {
     throw new AgentError('INVALID_INPUT', m);
@@ -975,17 +1112,18 @@ async function sendLoginInput(input) {
     default:
       bad('Unknown input type.');
   }
-  setTimeout(checkLoginDone, 800); // a click or Enter may just have finished the sign-in
+  setTimeout(() => checkLoginDone(s), 800); // a click or Enter may just have finished the sign-in
 }
 
 /**
- * Signs the agent out of Google: visits Google's sign-out page, clears every cookie of the
- * agent's browser profile and forgets the saved account name.
+ * Signs the user's agent browser out of Google: visits Google's sign-out page, clears every
+ * cookie of their profile and forgets their account name. Other users are not affected.
  */
-async function logoutGmail() {
-  if (login) await endLogin('cancelled');
-  return enqueue(async () => {
-    const context = await getContext(createLogger());
+async function logoutGmail(userId) {
+  const s = userSession(userId);
+  if (s.login) await endLogin(s, 'cancelled');
+  return enqueue(s, async () => {
+    const context = await getContext(s, createLogger());
     const page = await openPage(context);
     try {
       await page.goto('https://accounts.google.com/Logout', { waitUntil: 'domcontentloaded', timeout: 20_000 });
@@ -996,80 +1134,77 @@ async function logoutGmail() {
       await page.close().catch(() => {});
     }
     await context.clearCookies();
-    account = null;
-    try {
-      fs.unlinkSync(ACCOUNT_FILE);
-    } catch {
-      // No saved account.
-    }
-    lastFrame = null; // don't keep showing the old inbox in the preview
-    sessionCache = { result: { loggedIn: false, checkedAt: new Date().toISOString() }, at: Date.now() };
+    userStore.clearGmail(userId);
+    s.viewport.lastFrame = null; // don't keep showing the old inbox in the preview
+    s.sessionCache = { result: { loggedIn: false, checkedAt: new Date().toISOString() }, at: Date.now() };
     return { loggedIn: false };
   });
 }
 
+/** Server-wide numbers for /health (no user data). */
 function getStatus() {
+  let pendingTasks = 0;
+  for (const s of sessions.values()) pendingTasks += s.pending;
   return {
-    browserRunning: Boolean(contextPromise),
+    openBrowsers: pool.open.size,
+    maxBrowsers: CONFIG.maxBrowsers,
+    waitingForBrowser: pool.waiters.length,
     pendingTasks,
     headless: CONFIG.headless,
     dryRun: CONFIG.dryRun,
-    previewActive: viewportState.active,
-    loginActive: Boolean(login),
   };
 }
 
 // ---------------------------------------------------------------------------
-// Live browser preview (screencast)
+// Live browser preview (screencast), per user
 // ---------------------------------------------------------------------------
 //
 // Chrome's DevTools protocol can push a JPEG every time the page repaints
-// (Page.startScreencast). Frames are published on `viewportBus`; server.js
-// relays them to dashboards over SSE. Works in both headless and headed mode.
+// (Page.startScreencast). Frames are published on `viewportBus` tagged with the user's
+// id; server.js relays them over SSE only to that user. Works headless and headed.
 
 const viewportBus = new EventEmitter();
-viewportBus.setMaxListeners(100); // one listener pair per connected dashboard
+viewportBus.setMaxListeners(200); // one listener pair per connected dashboard
 
-let lastFrame = null; // replayed to viewers that connect mid-task or after it ends
-let viewportState = { active: false, url: null };
-
-function publishFrame(frame) {
-  lastFrame = frame;
-  viewportBus.emit('frame', frame);
+function publishFrame(s, frame) {
+  s.viewport.lastFrame = frame;
+  viewportBus.emit('frame', s.userId, frame);
 }
 
-function publishState(patch) {
-  viewportState = { ...viewportState, ...patch };
-  viewportBus.emit('state', viewportState);
+function publishState(s, patch) {
+  s.viewport.state = { ...s.viewport.state, ...patch };
+  viewportBus.emit('state', s.userId, s.viewport.state);
 }
 
-/** Subscribes to preview frames and state changes. Returns an unsubscribe function. */
-function subscribeViewport(onFrame, onState) {
-  viewportBus.on('frame', onFrame);
-  viewportBus.on('state', onState);
+/** Subscribes to one user's preview frames and state changes. Returns an unsubscribe function. */
+function subscribeViewport(userId, onFrame, onState) {
+  const frameListener = (uid, frame) => uid === userId && onFrame(frame);
+  const stateListener = (uid, state) => uid === userId && onState(state);
+  viewportBus.on('frame', frameListener);
+  viewportBus.on('state', stateListener);
   return () => {
-    viewportBus.off('frame', onFrame);
-    viewportBus.off('state', onState);
+    viewportBus.off('frame', frameListener);
+    viewportBus.off('state', stateListener);
   };
 }
 
-function getViewportSnapshot() {
-  return { state: viewportState, lastFrame };
+function getViewportSnapshot(userId) {
+  const s = userSession(userId);
+  return { state: s.viewport.state, lastFrame: s.viewport.lastFrame };
 }
 
 /**
- * Starts streaming `page` to the preview. Returns an async stop function that
- * publishes one final still (so viewers see the end state, e.g. "Message sent")
- * and then stops the screencast. Never throws: the preview is best-effort and
- * must not break the task itself.
+ * Starts streaming `page` to the user's preview. Returns an async stop function that
+ * publishes one final still (so they see the end state, e.g. "Message sent") and then
+ * stops the screencast. Never throws: the preview is best-effort.
  */
-async function startScreencast(page, log) {
+async function startScreencast(page, log, s) {
   const { enabled, quality, maxWidth } = CONFIG.screencast;
   if (!enabled) return async () => {};
 
   let session;
   const onNavigate = (frame) => {
-    if (frame === page.mainFrame()) publishState({ url: frame.url() });
+    if (frame === page.mainFrame()) publishState(s, { url: frame.url() });
   };
 
   try {
@@ -1077,7 +1212,7 @@ async function startScreencast(page, log) {
     session.on('Page.screencastFrame', ({ data, metadata, sessionId }) => {
       // Chrome sends the next frame only after the previous one is acknowledged.
       session.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
-      publishFrame({
+      publishFrame(s, {
         data, // base64 JPEG
         width: Math.round(metadata.deviceWidth),
         height: Math.round(metadata.deviceHeight),
@@ -1093,7 +1228,7 @@ async function startScreencast(page, log) {
       maxHeight: Math.round((maxWidth * CONFIG.viewport.height) / CONFIG.viewport.width),
       everyNthFrame: 1,
     });
-    publishState({ active: true, url: page.url() });
+    publishState(s, { active: true, url: page.url() });
   } catch (err) {
     log.warn(`Live preview unavailable: ${err.message}`);
     return async () => {};
@@ -1104,7 +1239,7 @@ async function startScreencast(page, log) {
     try {
       if (!page.isClosed()) {
         const still = await page.screenshot({ type: 'jpeg', quality });
-        publishFrame({
+        publishFrame(s, {
           data: still.toString('base64'),
           width: CONFIG.viewport.width,
           height: CONFIG.viewport.height,
@@ -1117,7 +1252,7 @@ async function startScreencast(page, log) {
     }
     await session.send('Page.stopScreencast').catch(() => {});
     await session.detach().catch(() => {});
-    publishState({ active: false });
+    publishState(s, { active: false });
   };
 }
 
@@ -1161,14 +1296,15 @@ async function firstVisible(scope, selector, timeout = 5000) {
   }
 }
 
-/** Saves a screenshot for debugging failed runs. Never throws. */
-async function captureScreenshot(page, log) {
+/** Saves a screenshot for debugging failed runs, in the user's own folder. Never throws. */
+async function captureScreenshot(page, log, userId) {
   if (!page || page.isClosed()) return null;
   try {
-    fs.mkdirSync(CONFIG.screenshotDir, { recursive: true });
-    const file = path.join(CONFIG.screenshotDir, `error-${Date.now()}.png`);
+    const dir = path.join(CONFIG.screenshotDir, userId || 'shared');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `error-${Date.now()}.png`);
     await page.screenshot({ path: file, fullPage: false });
-    log.info(`Saved failure screenshot: ${file}`);
+    log.info('Saved a screenshot of the failure for debugging');
     return file;
   } catch {
     return null;
@@ -1200,7 +1336,7 @@ async function openGmail(page, log) {
     throw new AgentError(
       'LOGIN_REQUIRED',
       composeOrLogin === 'login'
-        ? 'Gmail is not logged in for this browser profile. Run `npm run login` on this machine, sign in once, then retry.'
+        ? 'Gmail is not connected (or was signed out). Click "Connect Gmail" on the dashboard, sign in, then retry.'
         : 'Gmail did not finish loading in time. Check the network connection or increase ACTION_TIMEOUT_MS.',
       { url: page.url() }
     );
@@ -1388,17 +1524,19 @@ const TASK_HANDLERS = {
  *
  * @param {string|object} input          Natural-language command, or a structured task
  *                                        object from the form (see validateTask).
- * @param {object} [options]
+ * @param {object} options
+ * @param {string} options.userId    The user whose browser (and Gmail) runs the task.
  * @param {(entry: object) => void} [options.onLog]  Called for every log entry (live streaming).
  * @param {boolean} [options.dryRun]  Save emails to Drafts instead of sending (per-request safe mode).
  * @param {(task, result, log) => Promise<object>} [options.postProcess]  Runs after the task succeeds and may
  *                                        return an enriched result (planner.js uses it for AI summaries).
  * @returns {Promise<{success: boolean, task?: object, result?: object, error?: {code: string, message: string}, logs: object[], durationMs: number}>}
  */
-async function runBrowserAgent(input, { onLog, dryRun = false, postProcess } = {}) {
+async function runBrowserAgent(input, { userId, onLog, dryRun = false, postProcess } = {}) {
   const log = createLogger(onLog);
   const startedAt = Date.now();
   let task;
+  let s;
 
   // Interpret/validate before queueing so bad input fails instantly.
   try {
@@ -1414,28 +1552,34 @@ async function runBrowserAgent(input, { onLog, dryRun = false, postProcess } = {
       log.info('Safe mode is on: the email will be saved to Drafts, not sent');
     }
     log.success(`Interpreted task: ${task.type}`, task);
+    s = userSession(userId);
   } catch (err) {
     return finish(err);
   }
 
-  if (pendingTasks > 0) log.info(`Waiting for ${pendingTasks} earlier task(s) to finish...`);
+  if (s.pending > 0) log.info(`Waiting for your ${s.pending} earlier task(s) to finish…`);
 
-  return enqueue(async () => {
+  return enqueue(s, async () => {
     let page;
     let stopScreencast = async () => {};
     try {
-      const context = await getContext(log);
+      // Never connected: no need to take one of the shared browsers to find that out.
+      if (!s.contextPromise && !fs.existsSync(s.profileDir)) {
+        throw new AgentError('LOGIN_REQUIRED', 'Gmail is not connected yet. Click "Connect Gmail" on the dashboard, sign in once, then retry.');
+      }
+      const context = await getContext(s, log);
       page = await openPage(context);
-      stopScreencast = await startScreencast(page, log);
+      stopScreencast = await startScreencast(page, log, s);
       await openGmail(page, log);
-      await readAccount(page); // remember who is signed in (used to sign emails)
+      await readAccount(page, s); // remember who is signed in (used to sign emails)
       if (task.type === 'send_email') {
         // The email may have been written before the account name was known (first run,
         // schedules): add the name under the closing line now, just before typing.
-        const signed = signBody(task.body, senderName());
+        const name = senderName(userId);
+        const signed = signBody(task.body, name);
         if (signed !== task.body) {
           task.body = signed;
-          log.info(`Signed the email as "${senderName()}"`);
+          log.info(`Signed the email as "${name}"`);
         }
       }
       let result = await TASK_HANDLERS[task.type](page, task, log);
@@ -1443,7 +1587,7 @@ async function runBrowserAgent(input, { onLog, dryRun = false, postProcess } = {
       if (postProcess) result = await postProcess(task, result, log);
       return finish(null, result);
     } catch (err) {
-      await captureScreenshot(page, log);
+      await captureScreenshot(page, log, userId);
       return finish(err);
     } finally {
       await stopScreencast();
@@ -1453,9 +1597,10 @@ async function runBrowserAgent(input, { onLog, dryRun = false, postProcess } = {
 
   function finish(err, result) {
     const durationMs = Date.now() - startedAt;
-    // A finished run is the most reliable login check there is; refresh the cache with it.
-    if (!err || err.code === 'LOGIN_REQUIRED') {
-      sessionCache = { result: { loggedIn: !err, checkedAt: new Date().toISOString() }, at: Date.now() };
+    // A finished run is the most reliable login check there is; remember it for this user.
+    if (s && (!err || err.code === 'LOGIN_REQUIRED')) {
+      s.sessionCache = { result: { loggedIn: !err, checkedAt: new Date().toISOString() }, at: Date.now() };
+      userStore.setGmailStatus(s.userId, err ? 'disconnected' : 'connected');
     }
     if (!err) {
       log.success(`Task completed in ${(durationMs / 1000).toFixed(1)}s`);
@@ -1473,48 +1618,51 @@ async function runBrowserAgent(input, { onLog, dryRun = false, postProcess } = {
 }
 
 // ---------------------------------------------------------------------------
-// CLI: `node agent.js --login` and `node agent.js "<prompt>"`
+// CLI: `node agent.js --login <email>` (sign a user's agent browser in to Google)
 // ---------------------------------------------------------------------------
 
-/** Opens a visible browser on the persistent profile so you can sign in to Google once. */
-async function interactiveLogin() {
-  fs.mkdirSync(CONFIG.userDataDir, { recursive: true });
-  console.log(`\nOpening a browser with profile: ${CONFIG.userDataDir}`);
-  console.log('1. Sign in to your Google account (complete 2FA if asked).');
-  console.log('2. Wait until your Gmail inbox is visible.');
-  console.log('3. Close the browser window. Your session is saved.\n');
+/**
+ * Opens a visible browser on the user's profile so they can sign in to Google on this
+ * computer. (The dashboard's "Connect Gmail" does the same from any device.)
+ */
+async function interactiveLogin(email) {
+  const user = email && userStore.getByEmail(email);
+  if (!user) {
+    console.log('Usage: node agent.js --login <email of a user>   (create users with: npm run add-user)');
+    process.exitCode = 1;
+    return;
+  }
+  const profileDir = path.join(CONFIG.profilesDir, user.id);
+  fs.mkdirSync(profileDir, { recursive: true });
+  console.log(`\nOpening a browser for ${user.email}`);
+  console.log('1. Sign in to Google (complete 2FA if asked).');
+  console.log('2. Wait until the Gmail inbox is visible.');
+  console.log('3. Close the browser window. The session is saved for this user.\n');
 
-  const context = await chromium.launchPersistentContext(CONFIG.userDataDir, launchOptions({ headless: false, slowMo: 0 }));
+  const context = await chromium.launchPersistentContext(profileDir, launchOptions({ headless: false, slowMo: 0 }));
   const page = context.pages()[0] || (await context.newPage());
   await page.goto(GMAIL_URL);
   page
     .locator(SELECTORS.composeButton)
     .first()
     .waitFor({ state: 'visible', timeout: 0 })
-    .then(() => console.log('Gmail inbox detected: login saved. You can close the browser window now.'))
+    .then(async () => {
+      userStore.setGmailStatus(user.id, 'connected');
+      await readAccount(page, { userId: user.id });
+      console.log('Gmail inbox detected: login saved. You can close the browser window now.');
+    })
     .catch(() => {});
   await new Promise((resolve) => context.on('close', resolve));
-  console.log('Browser closed. Session stored in the profile directory.');
+  console.log('Browser closed. Session stored for this user.');
 }
 
 if (require.main === module) {
   const args = process.argv.slice(2);
   (async () => {
-    if (args[0] === '--login') {
-      await interactiveLogin();
-      return;
-    }
-    if (!args.length) {
-      console.log('Usage:\n  node agent.js --login\n  node agent.js "Send an email to john@example.com with subject \'Hi\' and message \'Hello\'"');
-      return;
-    }
-    const report = await runBrowserAgent(args.join(' '));
-    console.log(JSON.stringify({ success: report.success, result: report.result, error: report.error }, null, 2));
-    await closeBrowser();
-    process.exitCode = report.success ? 0 : 1;
-  })().catch(async (err) => {
+    if (args[0] === '--login') return interactiveLogin(args[1]);
+    console.log('Usage:\n  node agent.js --login <email>\n\nTasks are run through the dashboard (npm start).');
+  })().catch((err) => {
     console.error(err);
-    await closeBrowser();
     process.exit(1);
   });
 }
@@ -1532,6 +1680,7 @@ module.exports = {
   cancelLogin,
   loginStatus,
   logoutGmail,
+  removeUserData,
   closeBrowser,
   getStatus,
   subscribeViewport,

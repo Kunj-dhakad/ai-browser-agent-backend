@@ -7,11 +7,12 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
+    "add-user": "node scripts/add-user.js",
     "login": "node agent.js --login",
     "install-browser": "npx playwright install chromium"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.13"
   },
   "dependencies": {
     "cors": "^2.8.5",

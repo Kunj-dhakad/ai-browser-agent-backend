@@ -3,9 +3,9 @@
  * ---------------------------------------------------------------------------
  * The "brain" of the agent, powered by OpenAI.
  *
- *   planTask(prompt)      Natural language (English / Hindi / Hinglish, even rough notes) -> a Gmail
- *                         task. Writes a complete English email (subject + body, signed with
- *                         SENDER_NAME, or else the signed-in Gmail account's name) so the user
+ *   planTask(prompt, userId) Natural language (English / Hindi / Hinglish, even rough notes) -> a Gmail
+ *                         task. Writes a complete English email (subject + body, signed with the
+ *                         user's Gmail account name, or else their account name) so the user
  *                         only has to say what they want.
  *   createSummarizer(...) Short English summary of search / inbox results.
  *
@@ -42,7 +42,6 @@ function aiStatus() {
     enabled: Boolean(AI.apiKey),
     model: AI.apiKey ? AI.model : null,
     summarize: Boolean(AI.apiKey) && AI.summarize,
-    senderName: senderName() || null, // SENDER_NAME, else the signed-in Gmail account's name
   };
 }
 
@@ -74,9 +73,9 @@ const PLAN_SCHEMA = {
   },
 };
 
-function systemPrompt() {
+/** @param {string} name  Name to sign with (the user's Gmail account name); may be empty. */
+function systemPrompt(name) {
   const now = new Date();
-  const name = senderName(); // SENDER_NAME from .env, else the signed-in Gmail account's name
   const signOff = name
     ? `End with a closing line and the sender's name on the next line, e.g. "Best regards,\\n${name}".`
     : 'End with a short closing line such as "Best regards," or "Thanks,". Do not add any name or placeholder like [Your Name] (Gmail adds the signature).';
@@ -211,7 +210,8 @@ function describeTask(task) {
  * Plans a task from a natural-language prompt.
  * Returns { ai, model, task, summary }. Throws AgentError (NEEDS_INFO, UNSUPPORTED_TASK, AI_*).
  */
-async function planTask(prompt) {
+async function planTask(prompt, userId) {
+  const name = senderName(userId); // signs this user's emails
   const openai = getClient();
   if (!openai) {
     const task = parseCommand(prompt); // rule-based fallback
@@ -219,7 +219,7 @@ async function planTask(prompt) {
   }
 
   const messages = [
-    { role: 'system', content: systemPrompt() },
+    { role: 'system', content: systemPrompt(name) },
     { role: 'user', content: prompt },
   ];
   let completion;
@@ -237,7 +237,7 @@ async function planTask(prompt) {
       completion = await openai.chat.completions.create({
         model: AI.model,
         messages: [
-          { role: 'system', content: `${systemPrompt()}\n\n${JSON_ONLY_INSTRUCTIONS}` },
+          { role: 'system', content: `${systemPrompt(name)}\n\n${JSON_ONLY_INSTRUCTIONS}` },
           { role: 'user', content: prompt },
         ],
         response_format: { type: 'json_object' },
@@ -272,7 +272,7 @@ async function planTask(prompt) {
   }
   // Models sometimes ignore the length rule; one extra pass makes the email fuller (same facts).
   if (task.type === 'send_email' && wordCount(task.body) < MIN_BODY_WORDS && !WANTS_SHORT.test(prompt)) {
-    task.body = await expandBody(openai, prompt, task).catch(() => task.body);
+    task.body = await expandBody(openai, prompt, task, name).catch(() => task.body);
   }
   return { ai: true, model: AI.model, task: validateTask(task), summary: plan.summary || describeTask(task) };
 }
@@ -282,7 +282,7 @@ const WANTS_SHORT = /\b(short|brief|one[- ]line|quick|chhota|chota|kam shabd)\b/
 const wordCount = (s) => String(s || '').split(/\s+/).filter(Boolean).length;
 
 /** Rewrites a too-short email into a fuller one without adding facts. Returns the new body. */
-async function expandBody(openai, prompt, task) {
+async function expandBody(openai, prompt, task, name) {
   const completion = await openai.chat.completions.create({
     model: AI.model,
     messages: [
@@ -293,8 +293,8 @@ async function expandBody(openai, prompt, task) {
           'with a greeting, a friendly opener, 2-3 short paragraphs, a courteous closing line and the same sign-off. ' +
           'Keep every fact exactly (names, dates, times, requests). Do NOT invent new facts, promises, numbers or names. ' +
           'Keep the greeting exactly as in the draft. ' +
-          (senderName()
-            ? `End with "Best regards," and "${senderName()}" on the next line. `
+          (name
+            ? `End with "Best regards," and "${name}" on the next line. `
             : 'End with "Best regards," and NOTHING after it: no name and no placeholder such as [Your Name]. ') +
           'Return only the email body text, no subject line and no explanations.',
       },
