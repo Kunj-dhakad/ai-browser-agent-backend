@@ -14,7 +14,24 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { DatabaseSync } = require('node:sqlite');
+const { DatabaseSync } = withoutSqliteWarning(() => require('node:sqlite'));
+
+/**
+ * Node 22-24 prints "ExperimentalWarning: SQLite is an experimental feature" on load. It is
+ * harmless, but it lands in the middle of prompts (npm run add-user) and logs, so skip it.
+ */
+function withoutSqliteWarning(load) {
+  const emitWarning = process.emitWarning;
+  process.emitWarning = (warning, ...rest) => {
+    if (/SQLite is an experimental feature/i.test(String(warning && warning.message ? warning.message : warning))) return;
+    emitWarning.call(process, warning, ...rest);
+  };
+  try {
+    return load();
+  } finally {
+    process.emitWarning = emitWarning;
+  }
+}
 
 const DB_FILE = path.resolve(process.env.DB_FILE || './data/app.db');
 fs.mkdirSync(path.dirname(DB_FILE), { recursive: true });

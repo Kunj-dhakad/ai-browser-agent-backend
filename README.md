@@ -60,14 +60,14 @@ cp .env.example .env        # Windows PowerShell: Copy-Item .env.example .env
 #    then edit .env: set AGENT_API_KEY, AUTH_SECRET, OPENAI_API_KEY and CORS_ORIGINS
 
 # 4. Create the first admin (asks for email, name and password)
-npm run add-user -- --admin
+npm run add-admin
 ```
 
 ## Users and Gmail
 
-- **Admin:** create the first one with `npm run add-user -- --admin`. Admins add, edit, disable and delete users on the dashboard's **Manage users** page (or with `npm run add-user -- --email x@y.com --name "X" --password "..."`).
+- **Admin:** create the first one with `npm run add-admin`. Admins add, edit, disable and delete users on the dashboard's **Manage users** page (or with `npm run add-user -- --email x@y.com --name "X" --password "..."`).
 - **Gmail:** each user signs in to the dashboard, opens the Gmail agent and clicks **Connect Gmail**. Google's sign-in page opens in that user's own agent browser and is shown live in the dashboard; they sign in and pass 2FA once. No VNC or terminal needed, also on a headless server.
-- **Upgrading from the single-user version:** the first admin created with `add-user --admin` takes over the old `.browser-profile` folder and `data/account.json`, so that Gmail stays connected.
+- **Upgrading from the single-user version:** the first admin created with `npm run add-admin` takes over the old `.browser-profile` folder and `data/account.json`, so that Gmail stays connected.
 - **Terminal alternative:** `npm run login -- <user email>` opens a visible browser window to sign that user in (needs a display).
 
 > **If Google says "This browser or app may not be secure":** set `BROWSER_CHANNEL=chrome` in `.env` to use your installed Google Chrome, then connect again.
@@ -316,7 +316,7 @@ When a browser step fails, the agent saves a screenshot to `./screenshots/<userI
 | `BROWSER_IDLE_MINUTES` | `5` | Close a user's browser after this many idle minutes |
 | `DAILY_EMAIL_LIMIT` | `50` | Emails each user may send per day (admins can change it per user) |
 | `PROFILES_DIR` | `./data/profiles` | One browser profile (saved Google session) per user |
-| `USER_DATA_DIR` | `./.browser-profile` | Old single-user profile, moved to the first admin by `add-user --admin` |
+| `USER_DATA_DIR` | `./.browser-profile` | Old single-user profile, moved to the first admin by `npm run add-admin` |
 | `BROWSER_CHANNEL` | *(bundled Chromium)* | `chrome` or `msedge` to use an installed browser |
 | `TYPING_DELAY_MS` | `80` | Average delay between keystrokes |
 | `SLOW_MO_MS` | `0` | Extra delay on every Playwright action, useful when watching the agent |

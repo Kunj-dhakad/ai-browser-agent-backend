@@ -761,7 +761,7 @@ const server = app.listen(PORT, () => {
   console.log(`[server] AI Browser Agent listening on http://localhost:${PORT}`);
   console.log(`[server] Up to ${CONFIG.maxBrowsers} browsers at once; idle ones close after ${CONFIG.idleCloseMs / 60000} min`);
   if (!API_KEY) console.warn('[server] WARNING: AGENT_API_KEY is empty. Set it before exposing this server.');
-  if (users.count() === 0) console.warn('[server] No users yet. Create the first admin: npm run add-user -- --admin');
+  if (users.count() === 0) console.warn('[server] No users yet. Create the first admin: npm run add-admin');
   startScheduler(startRun); // runs scheduled tasks when they're due
 });
 
