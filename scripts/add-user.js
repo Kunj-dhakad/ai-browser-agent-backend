@@ -7,7 +7,7 @@
  *   npm run add-user -- --admin --email you@example.com --name "Your Name"
  *   npm run add-user -- --email friend@example.com --name "Friend" --password "secret123"
  *
- * Without --password you are asked for one. The first admin also takes over the
+ * Without --password you are asked for one. An admin created here also takes over the
  * Gmail login of the old single-user version (.browser-profile), if there is one,
  * so you don't have to connect Gmail again.
  * ---------------------------------------------------------------------------
@@ -69,10 +69,10 @@ async function main() {
   if (problem) throw new Error(problem);
   if (users.getByEmail(email)) throw new Error(`A user with email ${email} already exists.`);
 
-  const isFirstAdmin = admin && !users.firstAdmin();
+  const takesLegacy = admin; // the old single-user Gmail login goes to the first admin created here (moved only once)
   const user = users.create({ email, name, passwordHash: hashPassword(password), role: admin ? 'admin' : 'user' });
   console.log(`Created ${user.role} ${user.name} <${user.email}>`);
-  if (isFirstAdmin) migrateLegacy(user);
+  if (takesLegacy) migrateLegacy(user);
 }
 
 main().catch((err) => {
