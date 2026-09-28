@@ -632,7 +632,7 @@ function userSession(userId) {
       lastLoginResult: null,
       sessionCache: null, // { result, at } of the last Gmail login check
       accountLookup: null,
-      viewport: { state: { active: false, url: null }, lastFrame: null },
+      viewport: { state: { active: false, url: null }, lastFrame: null, viewers: 0 }, // viewers: open preview streams
     };
     sessions.set(userId, s);
   }
@@ -659,6 +659,12 @@ function launchOptions(overrides = {}) {
       '--disable-backgrounding-occluded-windows',
       '--disable-renderer-backgrounding',
       '--disable-background-timer-throttling',
+      // Less background work per browser (several run on one server).
+      '--disable-extensions',
+      '--disable-component-update',
+      '--disable-sync',
+      '--mute-audio',
+      '--disable-features=Translate,MediaRouter,OptimizationHints',
     ],
     ...overrides,
   };
@@ -1178,11 +1184,14 @@ function publishState(s, patch) {
 
 /** Subscribes to one user's preview frames and state changes. Returns an unsubscribe function. */
 function subscribeViewport(userId, onFrame, onState) {
+  const s = userSession(userId);
   const frameListener = (uid, frame) => uid === userId && onFrame(frame);
   const stateListener = (uid, state) => uid === userId && onState(state);
   viewportBus.on('frame', frameListener);
   viewportBus.on('state', stateListener);
+  s.viewport.viewers++;
   return () => {
+    s.viewport.viewers = Math.max(0, s.viewport.viewers - 1);
     viewportBus.off('frame', frameListener);
     viewportBus.off('state', stateListener);
   };
@@ -1203,15 +1212,28 @@ async function startScreencast(page, log, s) {
   if (!enabled) return async () => {};
 
   let session;
+  let stopped = false;
+  let nextAckAt = 0; // acks are spaced evenly (Chrome keeps up to 2 frames in flight)
   const onNavigate = (frame) => {
     if (frame === page.mainFrame()) publishState(s, { url: frame.url() });
+  };
+
+  // Chrome sends the next frame only after the previous one is acknowledged, and would
+  // otherwise encode up to 60 JPEGs a second. Delaying the ack caps that at what viewers get
+  // (maxFps), or 1 per second when nobody is watching: most of a browser's CPU otherwise
+  // goes into frames that are thrown away, which slows every browser on the server.
+  const ackLater = (sessionId) => {
+    const fps = s.viewport.viewers > 0 ? Math.max(1, CONFIG.screencast.maxFps) : 1;
+    nextAckAt = Math.max(Date.now(), nextAckAt + 1000 / fps);
+    setTimeout(() => {
+      if (!stopped) session.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
+    }, Math.max(0, nextAckAt - Date.now()));
   };
 
   try {
     session = await page.context().newCDPSession(page);
     session.on('Page.screencastFrame', ({ data, metadata, sessionId }) => {
-      // Chrome sends the next frame only after the previous one is acknowledged.
-      session.send('Page.screencastFrameAck', { sessionId }).catch(() => {});
+      ackLater(sessionId);
       publishFrame(s, {
         data, // base64 JPEG
         width: Math.round(metadata.deviceWidth),
@@ -1235,6 +1257,7 @@ async function startScreencast(page, log, s) {
   }
 
   return async () => {
+    stopped = true;
     page.off('framenavigated', onNavigate);
     try {
       if (!page.isClosed()) {
