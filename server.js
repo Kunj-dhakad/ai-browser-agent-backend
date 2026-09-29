@@ -91,12 +91,27 @@ const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:3000')
   .map((o) => o.trim().replace(/\/$/, ''))
   .filter(Boolean);
 
+/** "https://*.example.com" in CORS_ORIGINS allows every subdomain of example.com (https only). */
+function originAllowed(origin) {
+  if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) return true;
+  return allowedOrigins.some((o) => {
+    const m = o.match(/^(https?):\/\/\*\.(.+)$/);
+    if (!m) return false;
+    try {
+      const u = new URL(origin);
+      return u.protocol === m[1] + ':' && u.hostname.endsWith('.' + m[2]) && !u.port;
+    } catch {
+      return false;
+    }
+  });
+}
+
 app.use(
   cors({
     origin(origin, callback) {
       // Requests without an Origin header (curl, server-to-server) are allowed;
       // they are still protected by the API key and the user token.
-      if (!origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
+      if (!origin || originAllowed(origin)) {
         return callback(null, true);
       }
       return callback(null, false); // Browser will block the response.
@@ -186,8 +201,14 @@ const route = (fn) => async (req, res) => {
 // ---------------------------------------------------------------------------
 
 /** Constant-time API key check. Disabled when AGENT_API_KEY is empty. */
+// Called straight from the user's browser (PHP "AI Agent (Direct)" page: live picture and
+// typing into Google's sign-in), so without the API key, which stays on the servers. They
+// still need the user's token (requireUser), and only reach that user's own browser.
+const BROWSER_DIRECT = new Set(['GET /api/agent/screencast', 'GET /api/agent/screencast/frame', 'GET /api/agent/login', 'POST /api/agent/login/input']);
+
 function requireApiKey(req, res, next) {
   if (!API_KEY) return next();
+  if (BROWSER_DIRECT.has(`${req.method} ${req.baseUrl}${req.path}`)) return next();
   const provided = Buffer.from(String(req.get('x-api-key') || ''));
   const expected = Buffer.from(API_KEY);
   if (provided.length === expected.length && crypto.timingSafeEqual(provided, expected)) return next();
@@ -218,7 +239,8 @@ function userFromToken(token) {
 /** Loads the signed-in user from "Authorization: Bearer <token>" into req.user. */
 function requireUser(req, res, next) {
   const header = req.get('authorization') || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : '';
+  // ?access_token= only for GET: EventSource (the live picture stream) can't send headers.
+  const token = header.startsWith('Bearer ') ? header.slice(7) : req.method === 'GET' ? String(req.query.access_token || '') : '';
   const user = token ? userFromToken(token) : null;
   if (!user || user.disabled) {
     return res.status(401).json({ success: false, error: { code: 'UNAUTHENTICATED', message: 'Please sign in again.' } });
