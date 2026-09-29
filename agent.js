@@ -1197,8 +1197,9 @@ function subscribeViewport(userId, onFrame, onState) {
   };
 }
 
-function getViewportSnapshot(userId) {
+function getViewportSnapshot(userId, { polled = false } = {}) {
   const s = userSession(userId);
+  if (polled) s.viewport.polledAt = Date.now(); // a page polling frames counts as watching
   return { state: s.viewport.state, lastFrame: s.viewport.lastFrame };
 }
 
@@ -1223,7 +1224,8 @@ async function startScreencast(page, log, s) {
   // (maxFps), or 1 per second when nobody is watching: most of a browser's CPU otherwise
   // goes into frames that are thrown away, which slows every browser on the server.
   const ackLater = (sessionId) => {
-    const fps = s.viewport.viewers > 0 ? Math.max(1, CONFIG.screencast.maxFps) : 1;
+    const watching = s.viewport.viewers > 0 || Date.now() - (s.viewport.polledAt || 0) < 5000;
+    const fps = watching ? Math.max(1, CONFIG.screencast.maxFps) : 1;
     nextAckAt = Math.max(Date.now(), nextAckAt + 1000 / fps);
     setTimeout(() => {
       if (!stopped) session.send('Page.screencastFrameAck', { sessionId }).catch(() => {});

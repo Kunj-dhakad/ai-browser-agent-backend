@@ -26,6 +26,7 @@
  *   POST /api/agent/run             Run a command, respond once with all logs (JSON).
  *   POST /api/agent/stream          Run a command, stream logs live (SSE).
  *   GET  /api/agent/screencast      Live preview of the user's browser (SSE of JPEG frames).
+ *   GET  /api/agent/screencast/frame ?after=<ms> -> newest frame (polling alternative).
  *   GET  /api/agent/session         Is the user's agent browser signed in to Google?
  *   GET  /api/agent/login           Is a Gmail sign-in in progress?
  *   POST /api/agent/login/start     Open Google's sign-in page (Connect Gmail).
@@ -503,6 +504,18 @@ app.get('/api/agent/screencast', (req, res) => {
   });
 });
 
+/**
+ * Polling alternative to the screencast stream (for pages that can't keep a stream open, e.g.
+ * behind shared PHP hosting): { state, frame } where frame is the newest frame, or null when
+ * there is none newer than ?after=<frame time in ms>.
+ */
+app.get('/api/agent/screencast/frame', (req, res) => {
+  const { state, lastFrame } = getViewportSnapshot(req.user.id, { polled: true });
+  const after = Number(req.query.after) || 0;
+  res.set('Cache-Control', 'no-store');
+  res.json({ state, frame: lastFrame && lastFrame.time > after ? lastFrame : null });
+});
+
 // ---------------------------------------------------------------------------
 // Gmail connection of the user's agent browser
 // ---------------------------------------------------------------------------
@@ -710,9 +723,13 @@ function findRun(req, res) {
   return run;
 }
 
+/** ?since=<step>: only logs after that step (for pages that poll instead of streaming). */
 app.get('/api/agent/runs/:id', (req, res) => {
   const run = findRun(req, res);
-  if (run) res.json({ run: { ...runSummary(run), logs: run.logs, report: run.report } });
+  if (!run) return;
+  const since = parseInt(req.query.since, 10);
+  const logs = Number.isInteger(since) ? run.logs.filter((l) => l.step > since) : run.logs;
+  res.json({ run: { ...runSummary(run), logs, report: run.report } });
 });
 
 /** Events: run (summary), log (past ones replayed first, then live), result (final report). */
