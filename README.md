@@ -309,6 +309,8 @@ When a browser step fails, the agent saves a screenshot to `./screenshots/<userI
 | `CORS_ORIGINS` | `http://localhost:3000` | Comma-separated list of allowed frontend origins (`*` allows all) |
 | `AGENT_API_KEY` | *(empty)* | Shared secret for the `x-api-key` header. Always set this in production |
 | `HEADLESS` | `true` | `false` shows the browser window |
+| `AUTH_MODE` | `local` | Who signs users in: `local` (this app's login and users), `php` (the PHP app, which shows the dashboard in an iframe and gives it a signed token), or `both`. With `php`, users are created automatically from the token (linked by PHP user id) |
+| `PHP_TOKEN_SECRET` | *(empty)* | `AUTH_MODE=php/both`: the secret the PHP app signs its tokens with. Same value as `token_secret` in the PHP app's `application/config/browser_agent.php` |
 | `AUTH_SECRET` | *(random)* | Secret (32+ characters) that signs login tokens. If empty, everyone is logged out on each restart |
 | `SESSION_HOURS` | `12` | How long a login lasts |
 | `DB_FILE` | `./data/app.db` | SQLite user database |

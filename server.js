@@ -6,11 +6,12 @@
  *   GET  /health                    Liveness + server-wide status (no auth, no user data).
  *
  *   Every /api route needs the x-api-key header (sent by the Next.js proxy). Every route
- *   except /api/auth/login also needs "Authorization: Bearer <token>" for a signed-in user;
+ *   except /api/auth/login also needs "Authorization: Bearer <token>" for a signed-in user
+ *   (a token from our own login, or with AUTH_MODE=php one signed by the PHP app);
  *   everything below only ever sees and changes that user's own data.
  *
  *   Auth
- *   POST /api/auth/login            { email, password } -> { token, user }
+ *   POST /api/auth/login            { email, password } -> { token, user }  (not with AUTH_MODE=php)
  *   GET  /api/auth/me               The signed-in user.
  *
  *   Admin (role "admin")
@@ -73,6 +74,9 @@ const auth = require('./auth');
 const PORT = parseInt(process.env.PORT, 10) || 4000;
 const API_KEY = process.env.AGENT_API_KEY || '';
 const MAX_PROMPT_LENGTH = 2000;
+// Who signs users in: "local" (this app's own login page), "php" (the PHP app gives each user a
+// signed token; see auth.verifyPhpToken) or "both".
+const AUTH_MODE = ['local', 'php', 'both'].includes(process.env.AUTH_MODE) ? process.env.AUTH_MODE : 'local';
 
 const app = express();
 app.set('trust proxy', 'loopback'); // the Next.js proxy / Caddy run on this machine
@@ -189,12 +193,32 @@ function requireApiKey(req, res, next) {
   return res.status(401).json({ success: false, error: { code: 'UNAUTHORIZED', message: 'Invalid or missing x-api-key header.' } });
 }
 
+/** The signed-in user for a token: our own login (AUTH_MODE local/both) or the PHP app's (php/both). */
+function userFromToken(token) {
+  if (AUTH_MODE !== 'php') {
+    const claims = auth.verifyToken(token);
+    if (claims) return users.get(claims.uid);
+  }
+  if (AUTH_MODE !== 'local') {
+    const claims = auth.verifyPhpToken(token);
+    if (claims) {
+      const limit = Number(claims.limit);
+      return users.fromExternal({
+        externalId: claims.sub,
+        email: claims.email,
+        name: claims.name,
+        dailyEmailLimit: Number.isInteger(limit) ? limit : null,
+      });
+    }
+  }
+  return null;
+}
+
 /** Loads the signed-in user from "Authorization: Bearer <token>" into req.user. */
 function requireUser(req, res, next) {
   const header = req.get('authorization') || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : '';
-  const claims = auth.verifyToken(token);
-  const user = claims && users.get(claims.uid);
+  const user = token ? userFromToken(token) : null;
   if (!user || user.disabled) {
     return res.status(401).json({ success: false, error: { code: 'UNAUTHENTICATED', message: 'Please sign in again.' } });
   }
@@ -247,6 +271,7 @@ app.post(
   route(async (req, res) => {
     const email = String((req.body && req.body.email) || '').trim().toLowerCase();
     const password = String((req.body && req.body.password) || '');
+    if (AUTH_MODE === 'php') fail('FORBIDDEN', 'Sign in through the main app.');
     const key = `${email}|${req.ip}`;
     if (auth.loginLimiter.blocked(key)) fail('TOO_MANY_ATTEMPTS', 'Too many failed attempts. Try again in 15 minutes.');
     const user = email && users.getByEmail(email);
@@ -761,7 +786,8 @@ const server = app.listen(PORT, () => {
   console.log(`[server] AI Browser Agent listening on http://localhost:${PORT}`);
   console.log(`[server] Up to ${CONFIG.maxBrowsers} browsers at once; idle ones close after ${CONFIG.idleCloseMs / 60000} min`);
   if (!API_KEY) console.warn('[server] WARNING: AGENT_API_KEY is empty. Set it before exposing this server.');
-  if (users.count() === 0) console.warn('[server] No users yet. Create the first admin: npm run add-admin');
+  console.log(`[server] Sign-in: ${AUTH_MODE === 'php' ? 'through the PHP app (AUTH_MODE=php)' : AUTH_MODE === 'both' ? 'local accounts and the PHP app' : 'local accounts'}`);
+  if (AUTH_MODE !== 'php' && users.count() === 0) console.warn('[server] No users yet. Create the first admin: npm run add-admin');
   startScheduler(startRun); // runs scheduled tasks when they're due
 });
 

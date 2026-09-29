@@ -9,8 +9,7 @@
  *                                   the signature; it expires after SESSION_HOURS.
  *   loginLimiter                    Slows down password guessing (per email + IP).
  *
- * Later, a token issued by the PHP app can be accepted here instead (same shape of
- * "who is this user"), without changing the rest of the backend.
+ *   verifyPhpToken                  AUTH_MODE=php: tokens signed by the PHP app with PHP_TOKEN_SECRET.
  * ---------------------------------------------------------------------------
  */
 
@@ -85,6 +84,38 @@ function verifyToken(token) {
 }
 
 // ---------------------------------------------------------------------------
+// Tokens issued by the PHP app (AUTH_MODE=php)
+// ---------------------------------------------------------------------------
+//
+// The PHP app (CodeIgniter) signs in its users and gives the dashboard a short-lived token
+// in the same "<payload>.<signature>" format, signed with PHP_TOKEN_SECRET (the same value
+// is configured on the PHP side). Payload:
+//   { iss: "php", aud: "ai-browser-agent", sub: "<PHP user id>", email, name, iat, exp, limit? }
+
+const PHP_TOKEN_SECRET = process.env.PHP_TOKEN_SECRET || '';
+const PHP_TOKEN_MAX_HOURS = 24; // refuse tokens that claim to live longer than this
+
+/** Returns the PHP token's claims when it is valid and unexpired; otherwise null. */
+function verifyPhpToken(token) {
+  if (!PHP_TOKEN_SECRET || typeof token !== 'string') return null;
+  const [payload, signature] = token.split('.');
+  if (!payload || !signature) return null;
+  const expected = Buffer.from(crypto.createHmac('sha256', PHP_TOKEN_SECRET).update(payload).digest('base64url'));
+  const given = Buffer.from(signature);
+  if (expected.length !== given.length || !crypto.timingSafeEqual(expected, given)) return null;
+  try {
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    const now = Date.now() / 1000;
+    if (data.aud !== 'ai-browser-agent' || !data.sub || typeof data.exp !== 'number') return null;
+    if (data.exp < now || data.exp - now > PHP_TOKEN_MAX_HOURS * 3600) return null;
+    if (typeof data.email !== 'string' || !data.email.includes('@')) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Login attempt limiter (in memory)
 // ---------------------------------------------------------------------------
 
@@ -111,4 +142,8 @@ const loginLimiter = {
   reset: (key) => failures.delete(key),
 };
 
-module.exports = { hashPassword, verifyPassword, passwordProblem, signToken, verifyToken, loginLimiter, SESSION_HOURS };
+if (process.env.AUTH_MODE === 'php' && PHP_TOKEN_SECRET.length < 32) {
+  console.warn('[auth] AUTH_MODE=php needs PHP_TOKEN_SECRET (32+ characters, same value as in the PHP app). Nobody can sign in until it is set.');
+}
+
+module.exports = { hashPassword, verifyPassword, passwordProblem, signToken, verifyToken, verifyPhpToken, loginLimiter, SESSION_HOURS };
