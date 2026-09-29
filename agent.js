@@ -1132,8 +1132,10 @@ async function logoutGmail(userId) {
     const context = await getContext(s, createLogger());
     const page = await openPage(context);
     try {
-      await page.goto('https://accounts.google.com/Logout', { waitUntil: 'domcontentloaded', timeout: 20_000 });
-      await sleep(1500);
+      // Ends the session on Google's side too. Kept short: clearing the cookies below is what
+      // signs this browser out, and callers (e.g. a PHP proxy) may have a 30 s time limit.
+      await page.goto('https://accounts.google.com/Logout', { waitUntil: 'domcontentloaded', timeout: 8_000 });
+      await sleep(700);
     } catch {
       // Offline or slow: clearing the cookies below still signs this browser out.
     } finally {
