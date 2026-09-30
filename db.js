@@ -196,4 +196,95 @@ const usage = {
   limitFor: (user) => user.daily_email_limit ?? DEFAULT_DAILY_EMAIL_LIMIT,
 };
 
-module.exports = { db, users, usage, publicUser, today, DB_FILE };
+// ---------------------------------------------------------------------------
+// Run history: every task a user ran (task, status, logs, result), kept across restarts.
+// Live progress still comes from memory (server.js); this is the record afterwards.
+// ---------------------------------------------------------------------------
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS runs (
+    id          TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    source      TEXT,
+    prompt      TEXT,
+    scheduled   INTEGER NOT NULL DEFAULT 0,
+    task        TEXT NOT NULL,            -- JSON
+    status      TEXT NOT NULL,            -- running | success | error
+    created_at  TEXT NOT NULL,            -- ISO
+    finished_at TEXT,
+    duration_ms INTEGER,
+    report      TEXT,                     -- JSON (result or error, without logs)
+    logs        TEXT                      -- JSON array
+  );
+  CREATE INDEX IF NOT EXISTS runs_user_created ON runs(user_id, created_at DESC);
+`);
+
+const RUN_HISTORY_DAYS = parseInt(process.env.RUN_HISTORY_DAYS, 10) || 90;
+
+const runStmt = {
+  insert: db.prepare('INSERT INTO runs (id, user_id, source, prompt, scheduled, task, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'),
+  finish: db.prepare('UPDATE runs SET status = ?, task = ?, finished_at = ?, duration_ms = ?, report = ?, logs = ? WHERE id = ?'),
+  list: db.prepare('SELECT id, user_id, source, prompt, scheduled, task, status, created_at, duration_ms, report FROM runs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?'),
+  get: db.prepare('SELECT * FROM runs WHERE id = ?'),
+  stats: db.prepare(`SELECT COUNT(*) AS total,
+      SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success,
+      SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS failed,
+      SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running
+    FROM runs WHERE user_id = ? AND created_at >= ?`),
+  interrupt: db.prepare("UPDATE runs SET status = 'error', finished_at = ?, report = ? WHERE status = 'running'"),
+  prune: db.prepare('DELETE FROM runs WHERE created_at < ?'),
+};
+
+const parse = (s, fallback = null) => {
+  try {
+    return s ? JSON.parse(s) : fallback;
+  } catch {
+    return fallback;
+  }
+};
+
+/** A stored run in the same shape the API uses for live runs. */
+function runFromRow(r, { full = false } = {}) {
+  if (!r) return null;
+  const report = parse(r.report);
+  return {
+    id: r.id,
+    userId: r.user_id,
+    source: r.source,
+    prompt: r.prompt || undefined,
+    scheduled: Boolean(r.scheduled),
+    task: parse(r.task, {}),
+    status: r.status,
+    createdAt: Date.parse(r.created_at),
+    report: report ? { ...report, durationMs: r.duration_ms ?? report.durationMs } : null,
+    logs: full ? parse(r.logs, []) : undefined,
+  };
+}
+
+const runHistory = {
+  insert: (run) =>
+    runStmt.insert.run(run.id, run.userId, run.source || null, run.prompt || null, run.scheduled ? 1 : 0, JSON.stringify(run.task), run.status, new Date(run.createdAt).toISOString()),
+  finish(run) {
+    const { logs, ...report } = run.report || {};
+    runStmt.finish.run(run.status, JSON.stringify(run.task), new Date().toISOString(), report.durationMs ?? null, JSON.stringify(report), JSON.stringify(run.logs || logs || []), run.id);
+  },
+  /** Newest first, without logs. */
+  list: (userId, limit = 50) => runStmt.list.all(userId, limit).map((r) => runFromRow(r)),
+  /** One run with its logs and report, or null. */
+  get: (id) => runFromRow(runStmt.get.get(id), { full: true }),
+  /** { total, success, failed, running } since the given Date. */
+  stats(userId, since) {
+    const s = runStmt.stats.get(userId, since.toISOString()) || {};
+    return { total: s.total || 0, success: s.success || 0, failed: s.failed || 0, running: s.running || 0 };
+  },
+  /**
+   * Call once when the server starts: tasks still "running" belonged to the previous process
+   * and can't finish any more; old history is dropped (RUN_HISTORY_DAYS, default 90).
+   */
+  recoverAfterRestart() {
+    runStmt.interrupt.run(new Date().toISOString(), JSON.stringify({ success: false, error: { code: 'INTERRUPTED', message: 'The agent server restarted while this task was running. Run it again.' } }));
+    runStmt.prune.run(new Date(Date.now() - RUN_HISTORY_DAYS * 86400000).toISOString());
+  },
+};
+
+module.exports = { db, users, usage, runHistory, publicUser, today, DB_FILE };

@@ -34,7 +34,8 @@
  *   POST /api/agent/login/cancel    Close the sign-in page.
  *   POST /api/agent/logout          Sign the user's agent browser out of Google.
  *   POST /api/agent/runs            Start a run from a reviewed { task, prompt? } or from { prompt }.
- *   GET  /api/agent/runs            The user's recent runs.
+ *   GET  /api/agent/runs            The user's runs, newest first (saved history; ?limit=).
+ *   GET  /api/agent/stats           Dashboard numbers: today's usage + limit, task results today / 30 days.
  *   GET  /api/agent/runs/:id        One run with its logs and report.
  *   GET  /api/agent/runs/:id/stream SSE: past logs, then live logs, then the result.
  *   GET  /api/agent/schedules       The user's schedules.
@@ -69,7 +70,7 @@ const {
 } = require('./agent');
 const { planTask, createSummarizer, aiStatus } = require('./planner');
 const { startScheduler, stopScheduler, createSchedule, listSchedules, deleteSchedule, deleteUserSchedules } = require('./scheduler');
-const { users, usage, publicUser } = require('./db');
+const { users, usage, runHistory, publicUser } = require('./db');
 const auth = require('./auth');
 
 const PORT = parseInt(process.env.PORT, 10) || 4000;
@@ -638,6 +639,7 @@ function startRun({ userId, task, prompt, dryRun, scheduled = false }) {
   };
   run.events.setMaxListeners(50);
   runs.set(run.id, run);
+  runHistory.insert(run); // kept across restarts (Tasks page, dashboard)
   pruneRuns();
 
   const finish = (report) => {
@@ -645,6 +647,11 @@ function startRun({ userId, task, prompt, dryRun, scheduled = false }) {
     if (report.task) run.task = report.task;
     run.status = report.success ? 'success' : 'error';
     recordUsage(userId, report);
+    try {
+      runHistory.finish(run);
+    } catch (err) {
+      console.error('[server] Could not save run history:', err.message);
+    }
     run.events.emit('done', report);
   };
 
@@ -728,18 +735,32 @@ app.post(
   })
 );
 
+/** The user's runs, newest first (?limit=, default 50, max 200). From the saved history. */
 app.get('/api/agent/runs', (req, res) => {
-  res.json({ runs: [...runs.values()].filter((r) => r.userId === req.user.id).reverse().map(runSummary) });
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
+  res.json({ runs: runHistory.list(req.user.id, limit).map(runSummary) });
 });
 
-/** The run, if it exists and belongs to the signed-in user (otherwise a 404, never someone else's run). */
+/** Numbers for the dashboard: today's usage and limit, and task results today / last 30 days. */
+app.get('/api/agent/stats', (req, res) => {
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+  res.json({
+    today: { ...usage.today(req.user.id), ...runHistory.stats(req.user.id, startOfToday) },
+    dailyEmailLimit: usage.limitFor(req.user),
+    last30Days: runHistory.stats(req.user.id, new Date(Date.now() - 30 * 86400000)),
+  });
+});
+
+/**
+ * The run, if it exists and belongs to the signed-in user (otherwise a 404, never someone
+ * else's run): the live one while it runs, else the saved record.
+ */
 function findRun(req, res) {
-  const run = runs.get(req.params.id);
+  const live = runs.get(req.params.id);
+  const run = live || runHistory.get(req.params.id);
   if (!run || run.userId !== req.user.id) {
-    res.status(404).json({
-      success: false,
-      error: { code: 'RUN_NOT_FOUND', message: 'This run does not exist (runs are forgotten after a server restart or 1 hour).' },
-    });
+    res.status(404).json({ success: false, error: { code: 'RUN_NOT_FOUND', message: 'This run does not exist.' } });
     return null;
   }
   return run;
@@ -761,7 +782,7 @@ app.get('/api/agent/runs/:id/stream', (req, res) => {
   const sse = openSse(res);
   sse.send('run', runSummary(run));
   run.logs.forEach((entry) => sse.send('log', entry));
-  if (run.report) {
+  if (run.report || !run.events) {
     sse.send('result', run.report);
     return sse.end();
   }
@@ -827,6 +848,7 @@ const server = app.listen(PORT, () => {
   if (!API_KEY) console.warn('[server] WARNING: AGENT_API_KEY is empty. Set it before exposing this server.');
   console.log(`[server] Sign-in: ${AUTH_MODE === 'php' ? 'through the PHP app (AUTH_MODE=php)' : AUTH_MODE === 'both' ? 'local accounts and the PHP app' : 'local accounts'}`);
   if (AUTH_MODE !== 'php' && users.count() === 0) console.warn('[server] No users yet. Create the first admin: npm run add-admin');
+  runHistory.recoverAfterRestart(); // tasks cut off by the last shutdown are marked as interrupted
   startScheduler(startRun); // runs scheduled tasks when they're due
 });
 
