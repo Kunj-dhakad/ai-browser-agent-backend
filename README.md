@@ -239,8 +239,11 @@ Structured task shapes (validated by `validateTask` in `agent.js`):
 { "type": "send_email", "to": ["a@b.com"], "subject": "Hi", "body": "Hello\nsecond line", "sendMode": "send" }
 { "type": "search_email", "query": "is:unread from:amazon", "limit": 10 }
 { "type": "read_inbox", "limit": 5 }
+{ "type": "maps_search", "query": "dentists", "location": "Austin, TX", "limit": 20 }
 ```
 Because the form sends these fields directly, quotes, apostrophes and new lines in the message reach Gmail exactly as typed.
+
+`maps_search` (Google Maps lead scraper) does not need Gmail. It searches Google Maps for "query in location", scrolls the result list, and opens each place to read its details. `limit` is 1-100 (default 20) and each lead takes about 1-2 seconds. Its result is `{ query, location, leads: [{ name, category, rating, reviews, phone, website, address, url }] }`. If a place's panel shows no phone and no website (sponsored listings open a shorter panel), the agent reads that place's own page in a second tab. Any field Maps doesn't show is left empty.
 
 ### Schedules
 Run a planned task later or repeatedly. The task (for example, the AI-written email) is fixed when you create the schedule.

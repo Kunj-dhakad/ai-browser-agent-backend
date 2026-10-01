@@ -122,7 +122,7 @@ WRITING THE EMAIL (subject + body). This is the most important part; write it li
 SEARCH (search_email): turn the request into a Gmail query with operators like from:, to:, subject:, is:unread, has:attachment, newer_than:7d, after:YYYY/MM/DD.
 LIMIT: the number the user asked for, else 5 (max 50). For email actions use 5.
 SUMMARY: one short English sentence saying what will happen, e.g. "Send Rahul an email that tomorrow's meeting moved to 4 PM."
-UNSUPPORTED: anything else (other websites, Google Maps, shopping, deleting emails, several different tasks at once) -> "unsupported", and in "question" explain briefly in English what the agent can do instead.
+UNSUPPORTED: anything else (other websites, Google Maps, shopping, deleting emails, several different tasks at once) -> "unsupported", and in "question" explain briefly in English what the agent can do instead. For finding businesses / leads on Google Maps, tell the user to use the "Google Maps Lead Scraper" agent.
 Unused fields must be empty strings / an empty array; limit 5.`;
 }
 
@@ -203,6 +203,7 @@ function planToTask(plan) {
 function describeTask(task) {
   if (task.type === 'send_email') return `${task.sendMode === 'draft' ? 'Save a draft' : 'Send an email'} to ${task.to.join(', ')}`;
   if (task.type === 'search_email') return `Search Gmail for "${task.query}"`;
+  if (task.type === 'maps_search') return `Find ${task.limit} businesses on Google Maps: ${task.query}${task.location ? ` in ${task.location}` : ''}`;
   return `Read the latest ${task.limit} inbox emails`;
 }
 

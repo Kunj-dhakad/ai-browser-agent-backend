@@ -61,6 +61,7 @@ const CONFIG = {
 };
 
 const GMAIL_URL = 'https://mail.google.com/mail/u/0/#inbox';
+const MAPS_MAX_RESULTS = 100; // Google Maps lists stop around 120 places per search anyway
 
 /**
  * Gmail DOM selectors, kept in one place because Gmail changes its markup
@@ -593,6 +594,17 @@ function validateTask(input) {
     }
     case 'read_inbox':
       return { type: 'read_inbox', limit: limitOf(input.limit) };
+    case 'maps_search': {
+      const query = str(input.query, 'query', 200);
+      if (!query) fail('Write what kind of business to search for, e.g. "dentists".');
+      const location = str(input.location, 'location', 200);
+      let limit = 20;
+      if (input.limit !== undefined) {
+        limit = Number(input.limit);
+        if (!Number.isInteger(limit) || limit < 1 || limit > MAPS_MAX_RESULTS) fail(`"limit" must be a whole number from 1 to ${MAPS_MAX_RESULTS}.`);
+      }
+      return { type: 'maps_search', query, location, limit };
+    }
     default:
       return fail(`Unknown task type "${input.type}".`);
   }
@@ -1535,11 +1547,172 @@ async function readInbox(page, task, log) {
   return { emails };
 }
 
+// ---------------------------------------------------------------------------
+// Google Maps lead scraper (no Gmail needed)
+// ---------------------------------------------------------------------------
+
+const MAPS_SELECTORS = {
+  feed: 'div[role="feed"]',
+  placeLink: 'div[role="feed"] a.hfpxzc', // one per place in the result list; aria-label = name
+  listEnd: 'div[role="feed"] span.HlvSq', // "You've reached the end of the list."
+  placeTitle: 'h1.DUwDvf',
+  consentAccept: 'form[action*="consent"] button, button[aria-label*="Accept all" i]',
+};
+
+/**
+ * Reads the open place panel (right of the list, or the whole page on a place's own page).
+ * Missing fields are left empty. Without `name`, the first panel with a title is read.
+ */
+async function readPlacePanel(page, name) {
+  const panel = name
+    ? page.locator(`div[role="main"][aria-label="${name.replace(/["\\]/g, '\\$&')}"]`).first()
+    : page.locator(`div[role="main"]:has(${MAPS_SELECTORS.placeTitle})`).first();
+  await panel.locator('h1').first().waitFor({ timeout: 8000 });
+  // Contact rows load a moment after the title.
+  await panel
+    .locator('button[data-item-id="address"], a[data-item-id="authority"], button[data-item-id^="phone:tel:"]')
+    .first()
+    .waitFor({ timeout: 3000 })
+    .catch(() => {});
+  return panel.evaluate((el) => {
+    const q = (s) => el.querySelector(s);
+    const text = (s) => (q(s) ? q(s).textContent.trim() : '');
+    const attr = (s, a) => (q(s) ? q(s).getAttribute(a) || '' : '');
+    const reviewsLabel = [...el.querySelectorAll('[aria-label]')]
+      .map((e) => e.getAttribute('aria-label'))
+      .find((l) => /^[\d,.]+\s+reviews?$/i.test(l.trim()));
+    return {
+      category: text('button.DkEaL'),
+      rating: text('div.F7nice span[aria-hidden="true"]'),
+      reviews: reviewsLabel ? reviewsLabel.replace(/[^\d]/g, '') : '',
+      phone: attr('button[data-item-id^="phone:tel:"]', 'aria-label').replace(/^Phone:\s*/i, '').trim(),
+      website: attr('a[data-item-id="authority"]', 'href'),
+      address: attr('button[data-item-id="address"]', 'aria-label').replace(/^Address:\s*/i, '').trim(),
+    };
+  });
+}
+
+/**
+ * Second try for a place whose panel showed no phone and no website (e.g. a sponsored
+ * listing opens a shorter panel): opens the place's own page in a new tab and reads it there.
+ */
+async function readPlacePage(context, url) {
+  const tab = await context.newPage();
+  try {
+    await tab.goto(url + (url.includes('?') ? '&' : '?') + 'hl=en', { waitUntil: 'domcontentloaded', timeout: CONFIG.actionTimeoutMs });
+    await tab.locator(MAPS_SELECTORS.placeTitle).first().waitFor({ timeout: 10000 });
+    return await readPlacePanel(tab, null);
+  } catch {
+    return {};
+  } finally {
+    await tab.close().catch(() => {});
+  }
+}
+
+/**
+ * Searches Google Maps for "<query> in <location>" and collects up to `limit` businesses:
+ * name, category, rating, reviews, phone, website, address and the Maps link.
+ */
+async function mapsSearch(page, task, log) {
+  const search = task.location ? `${task.query} in ${task.location}` : task.query;
+  log.action(`Opening Google Maps and searching "${search}"`);
+  await page.goto(`https://www.google.com/maps/search/${encodeURIComponent(search)}?hl=en`, {
+    waitUntil: 'domcontentloaded',
+    timeout: CONFIG.actionTimeoutMs,
+  });
+  if (/consent\.google\./.test(page.url())) {
+    log.info('Accepting Google\'s cookie notice');
+    await page.locator(MAPS_SELECTORS.consentAccept).first().click({ timeout: 10000 }).catch(() => {});
+    await page.waitForURL(/google\.[^/]+\/maps/, { timeout: CONFIG.actionTimeoutMs }).catch(() => {});
+  }
+  await page.locator(`${MAPS_SELECTORS.feed}, ${MAPS_SELECTORS.placeTitle}`).first().waitFor({ timeout: CONFIG.actionTimeoutMs });
+
+  // The search matched one exact place: Maps opens it directly instead of a list.
+  if (!(await page.locator(MAPS_SELECTORS.feed).count())) {
+    const name = (await page.locator(MAPS_SELECTORS.placeTitle).first().textContent()).trim();
+    const lead = { name, ...(await readPlacePanel(page, name).catch(() => ({}))), url: page.url() };
+    log.success(`Found 1 business: ${name}`);
+    return { query: task.query, location: task.location, leads: [lead] };
+  }
+
+  // 1. Scroll the result list until it holds enough places (or Maps has no more).
+  log.action(`Loading up to ${task.limit} businesses from the list`);
+  let count = 0;
+  let unchanged = 0;
+  for (let i = 0; i < 60; i++) {
+    count = await page.locator(MAPS_SELECTORS.placeLink).count();
+    if (count >= task.limit || (await page.locator(MAPS_SELECTORS.listEnd).count())) break;
+    const before = count;
+    await page.locator(MAPS_SELECTORS.feed).evaluate((feed) => feed.scrollBy(0, feed.scrollHeight));
+    await sleep(1200);
+    count = await page.locator(MAPS_SELECTORS.placeLink).count();
+    unchanged = count === before ? unchanged + 1 : 0;
+    if (unchanged >= 4) break; // nothing new after ~5 s: end of the results
+  }
+  const places = await page
+    .locator(MAPS_SELECTORS.placeLink)
+    .evaluateAll((links, max) => links.slice(0, max).map((a) => ({ name: a.getAttribute('aria-label') || '', url: a.href })), task.limit);
+  if (!places.length) {
+    log.success(`No businesses found for "${search}"`);
+    return { query: task.query, location: task.location, leads: [] };
+  }
+  log.info(`Found ${places.length} businesses, reading their details…`);
+
+  // 2. Open each place to read its phone, website and address.
+  const leads = [];
+  const seen = new Set();
+  for (let i = 0; i < places.length; i++) {
+    const place = places[i];
+    let details = {};
+    try {
+      const link = page.locator(MAPS_SELECTORS.placeLink).nth(i);
+      await link.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+      await link.click({ timeout: 10000 });
+      details = await readPlacePanel(page, place.name);
+    } catch {
+      // handled below: the place's own page is tried next
+    }
+    if (!details.phone && !details.website) {
+      const again = await readPlacePage(page.context(), place.url.split('?')[0]);
+      Object.keys(again).forEach((k) => {
+        if (again[k] && !details[k]) details[k] = again[k];
+      });
+      if (!details.address && !details.phone && !details.website) {
+        log.warn(`Could not read the details of "${place.name}"; kept its name and link`);
+      }
+    }
+    const lead = {
+      name: place.name,
+      category: details.category || '',
+      rating: details.rating || '',
+      reviews: details.reviews || '',
+      phone: details.phone || '',
+      website: details.website || '',
+      address: details.address || '',
+      url: place.url.split('?')[0],
+    };
+    const key = `${lead.name}|${lead.address}`.toLowerCase();
+    if (seen.has(key)) continue; // sponsored places can appear twice
+    seen.add(key);
+    leads.push(lead);
+    log.info(`${leads.length}. ${lead.name}${lead.phone ? ` · ${lead.phone}` : ''}`);
+  }
+
+  const withPhone = leads.filter((l) => l.phone).length;
+  const withSite = leads.filter((l) => l.website).length;
+  log.success(`Collected ${leads.length} lead(s): ${withPhone} with a phone number, ${withSite} with a website`);
+  return { query: task.query, location: task.location, leads };
+}
+
 const TASK_HANDLERS = {
   send_email: sendEmail,
   search_email: searchEmail,
   read_inbox: readInbox,
+  maps_search: mapsSearch,
 };
+
+/** Tasks that work inside the user's Gmail (they need "Connect Gmail" first). */
+const needsGmail = (task) => task.type !== 'maps_search';
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -1591,14 +1764,16 @@ async function runBrowserAgent(input, { userId, onLog, dryRun = false, postProce
     let stopScreencast = async () => {};
     try {
       // Never connected: no need to take one of the shared browsers to find that out.
-      if (!s.contextPromise && !fs.existsSync(s.profileDir)) {
+      if (needsGmail(task) && !s.contextPromise && !fs.existsSync(s.profileDir)) {
         throw new AgentError('LOGIN_REQUIRED', 'Gmail is not connected yet. Click "Connect Gmail" on the dashboard, sign in once, then retry.');
       }
       const context = await getContext(s, log);
       page = await openPage(context);
       stopScreencast = await startScreencast(page, log, s);
-      await openGmail(page, log);
-      await readAccount(page, s); // remember who is signed in (used to sign emails)
+      if (needsGmail(task)) {
+        await openGmail(page, log);
+        await readAccount(page, s); // remember who is signed in (used to sign emails)
+      }
       if (task.type === 'send_email') {
         // The email may have been written before the account name was known (first run,
         // schedules): add the name under the closing line now, just before typing.
@@ -1625,7 +1800,7 @@ async function runBrowserAgent(input, { userId, onLog, dryRun = false, postProce
   function finish(err, result) {
     const durationMs = Date.now() - startedAt;
     // A finished run is the most reliable login check there is; remember it for this user.
-    if (s && (!err || err.code === 'LOGIN_REQUIRED')) {
+    if (s && task && needsGmail(task) && (!err || err.code === 'LOGIN_REQUIRED')) {
       s.sessionCache = { result: { loggedIn: !err, checkedAt: new Date().toISOString() }, at: Date.now() };
       userStore.setGmailStatus(s.userId, err ? 'disconnected' : 'connected');
     }
