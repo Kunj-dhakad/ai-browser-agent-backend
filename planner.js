@@ -203,6 +203,8 @@ function planToTask(plan) {
 function describeTask(task) {
   if (task.type === 'send_email') return `${task.sendMode === 'draft' ? 'Save a draft' : 'Send an email'} to ${task.to.join(', ')}`;
   if (task.type === 'search_email') return `Search Gmail for "${task.query}"`;
+  if (task.type === 'amazon_research') return `Research ${task.limit} Amazon products: ${task.query}`;
+  if (task.type === 'website_contacts') return `Find contact details on ${task.urls.length} website(s)`;
   if (task.type === 'maps_search') return `Find ${task.limit} businesses on Google Maps: ${task.query}${task.location ? ` in ${task.location}` : ''}`;
   return `Read the latest ${task.limit} inbox emails`;
 }
@@ -332,6 +334,7 @@ function cleanBody(body) {
  */
 function createSummarizer(userPrompt) {
   return async (task, result, log) => {
+    if (task.type === 'amazon_research') return compareProducts(task, result, log);
     const openai = getClient();
     const rows = (result && (result.results || result.emails)) || [];
     if (!openai || !AI.summarize || !rows.length) return result;
@@ -365,6 +368,61 @@ function createSummarizer(userPrompt) {
     }
     return result;
   };
+}
+
+/**
+ * Amazon research: from the products' features and top reviews, the AI writes 2-3 pros and
+ * cons per product and a short verdict (best overall / best value / what to avoid).
+ * Adds `result.summary` and `pros` / `cons` on each product it could judge.
+ */
+async function compareProducts(task, result, log) {
+  const openai = getClient();
+  const products = ((result && result.products) || []).filter((p) => (p.reviews && p.reviews.length) || (p.features && p.features.length) || p.customersSay);
+  if (!openai || !AI.summarize || !products.length) return result;
+
+  log.action(`Asking AI to compare ${products.length} products`);
+  try {
+    const completion = await openai.chat.completions.create({
+      model: AI.model,
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You compare Amazon products for a shopper, using ONLY the data given (title, price, rating, features, Amazon customer summary, review topics marked positive or negative, customer reviews). ' +
+            'Reply with JSON: {"summary": "3-4 short bullet points, each starting with \\"- \\": best overall, best value, and anything to watch out for, naming products by brand or short name", ' +
+            '"products": [{"asin": "...", "pros": ["2-3 short points from reviews/features"], "cons": ["1-3 short points from reviews; [] if none"]}]}. ' +
+            'Plain English, no invented facts, each point under 12 words.',
+        },
+        {
+          role: 'user',
+          content: `Search: ${task.query}\n\nProducts (JSON):\n${JSON.stringify(
+            products.map((p) => ({
+              asin: p.asin,
+              title: p.title.slice(0, 120),
+              brand: p.brand,
+              price: p.price,
+              rating: p.rating,
+              ratings: p.ratings,
+              features: (p.features || []).map((f) => f.slice(0, 200)),
+              customersSay: p.customersSay || undefined,
+              reviewTopics: (p.aspects || []).map((a) => `${a.name} (${a.mentions} mentions, ${a.sentiment || 'unknown'})`),
+              reviews: (p.reviews || []).map((r) => `${r.stars}★ ${r.title}: ${r.text.slice(0, 300)}`),
+            }))
+          )}`,
+        },
+      ],
+    });
+    const data = JSON.parse(extractJson(completion.choices[0] && completion.choices[0].message.content));
+    const byAsin = new Map((Array.isArray(data.products) ? data.products : []).map((x) => [x.asin, x]));
+    const list = (v) => (Array.isArray(v) ? v.filter((s) => typeof s === 'string').slice(0, 3) : []);
+    const merged = result.products.map((p) => (byAsin.has(p.asin) ? { ...p, pros: list(byAsin.get(p.asin).pros), cons: list(byAsin.get(p.asin).cons) } : p));
+    log.success('AI comparison ready');
+    return { ...result, products: merged, summary: typeof data.summary === 'string' ? data.summary.trim() : '' };
+  } catch (err) {
+    log.warn(`AI comparison skipped: ${toAgentError(err).message}`);
+    return result;
+  }
 }
 
 module.exports = { planTask, createSummarizer, aiStatus };

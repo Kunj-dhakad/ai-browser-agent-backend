@@ -240,10 +240,18 @@ Structured task shapes (validated by `validateTask` in `agent.js`):
 { "type": "search_email", "query": "is:unread from:amazon", "limit": 10 }
 { "type": "read_inbox", "limit": 5 }
 { "type": "maps_search", "query": "dentists", "location": "Austin, TX", "limit": 20 }
+{ "type": "website_contacts", "urls": ["example.com", "https://another-site.com/about"] }
+{ "type": "amazon_research", "query": "wireless earbuds", "limit": 10, "details": true }
 ```
 Because the form sends these fields directly, quotes, apostrophes and new lines in the message reach Gmail exactly as typed.
 
 `maps_search` (Google Maps lead scraper) does not need Gmail. It searches Google Maps for "query in location", scrolls the result list, and opens each place to read its details. `limit` is 1-100 (default 20) and each lead takes about 1-2 seconds. Its result is `{ query, location, leads: [{ name, category, rating, reviews, phone, website, address, url }] }`. If a place's panel shows no phone and no website (sponsored listings open a shorter panel), the agent reads that place's own page in a second tab. Any field Maps doesn't show is left empty.
+
+`website_contacts` (website contact extractor) does not need Gmail either. It takes 1-50 website addresses (`https://` is added when missing). For each site it opens the home page and the contact page it links to, and collects emails (`mailto:` links, the page text and Cloudflare-protected addresses), phone numbers (`tel:` links, or numbers written in the text), social profiles (Facebook, Instagram, LinkedIn, X, YouTube, TikTok) and the contact page link. The result is `{ sites: [{ website, name, emails, phones, socials, contactPage, error }] }`. A site that can't be opened gets an `error` and the task continues. Sites are checked one after the other at about 5-15 seconds each; parallel tabs were measured to be about 2x slower, because Chrome throttles background tabs. Pictures, fonts and video are not loaded.
+
+`amazon_research` (Amazon product researcher) does not need Gmail. It searches Amazon.com and returns up to 30 products (`limit`, default 10): title, price, rating, number of ratings, "bought in past month", sponsored or not, and link. With `details` (default `true`) it also opens the top 10 product pages for the brand, features, Best Sellers Rank and up to 8 top reviews, and the AI (when enabled) adds `pros` / `cons` per product and a short `summary` (best overall, best value, what to avoid). Amazon hides prices of products it can't ship to the visitor's country, so the first run sets the delivery location to a US ZIP code (10001), which stays in the user's browser profile. Amazon shows a captcha or a "Sorry! Something went wrong" page when it suspects a bot; the task then stops with `SITE_BLOCKED`. Amazon tabs are opened without the user-agent override used for Google, because Amazon rejects it. The full review list needs an Amazon login, so only the reviews on the product page are read.
+
+Because the browser runs on the server, addresses of the server itself and of private networks (`localhost`, `10.x`, `192.168.x`, `169.254.169.254`, ...) are refused, both when the task is created and for every request the page makes (redirects included).
 
 ### Schedules
 Run a planned task later or repeatedly. The task (for example, the AI-written email) is fixed when you create the schedule.

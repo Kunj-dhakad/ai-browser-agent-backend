@@ -62,6 +62,45 @@ const CONFIG = {
 
 const GMAIL_URL = 'https://mail.google.com/mail/u/0/#inbox';
 const MAPS_MAX_RESULTS = 100; // Google Maps lists stop around 120 places per search anyway
+const CONTACTS_MAX_SITES = 50; // websites per contact-extractor task (~3-8 s each)
+const AMAZON_MAX_RESULTS = 30; // products per Amazon research task (one search page)
+const AMAZON_MAX_DETAILS = 10; // of those, product pages opened for features and reviews (~5 s each)
+
+/**
+ * "example.com", "www.example.com/contact" or "https://example.com" -> a full https URL, or
+ * null when it isn't a public website: the agent's browser runs on our server, so it must
+ * never be pointed at the server itself or the private network (e.g. the cloud metadata
+ * address 169.254.169.254).
+ */
+function normalizeSiteUrl(raw) {
+  let s = String(raw).trim();
+  if (!s) return null;
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s = `https://${s.replace(/^\/+/, '')}`;
+  let u;
+  try {
+    u = new URL(s);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+  if (u.username || u.password) return null;
+  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host.includes('.') && !host.includes(':')) return null; // "localhost", "intranet"
+  if (/(^|\.)(localhost|local|internal|intranet|lan|home|corp)$/.test(host)) return null;
+  if (/^\d+(\.\d+){3}$/.test(host)) {
+    const [a, b] = host.split('.').map(Number);
+    const privateV4 =
+      a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224;
+    if (privateV4) return null;
+  } else if (host.includes(':')) {
+    return null; // IPv6 literals: not needed for real websites
+  } else if (/^\d+$/.test(host.replace(/\./g, ''))) {
+    return null; // odd numeric forms like 2130706433 or 0x7f.1
+  }
+  u.hash = '';
+  return u.toString();
+}
 
 /**
  * Gmail DOM selectors, kept in one place because Gmail changes its markup
@@ -605,6 +644,36 @@ function validateTask(input) {
       }
       return { type: 'maps_search', query, location, limit };
     }
+    case 'website_contacts': {
+      const list = typeof input.urls === 'string' ? input.urls.split(/[\s,]+/) : input.urls;
+      if (!Array.isArray(list)) fail('"urls" must be a list of website addresses.');
+      const urls = [];
+      const seen = new Set();
+      list.forEach((u, i) => {
+        const raw = str(u, `urls[${i}]`, 500);
+        if (!raw) return;
+        const url = normalizeSiteUrl(raw);
+        if (!url) fail(`"${raw.slice(0, 80)}" is not a public website address.`);
+        const key = url.replace(/\/$/, '').toLowerCase();
+        if (!seen.has(key)) {
+          seen.add(key);
+          urls.push(url);
+        }
+      });
+      if (!urls.length) fail('Add at least one website address.');
+      if (urls.length > CONTACTS_MAX_SITES) fail(`At most ${CONTACTS_MAX_SITES} websites per task.`);
+      return { type: 'website_contacts', urls };
+    }
+    case 'amazon_research': {
+      const query = str(input.query, 'query', 200);
+      if (!query) fail('Write what product to research, e.g. "wireless earbuds".');
+      let limit = 10;
+      if (input.limit !== undefined) {
+        limit = Number(input.limit);
+        if (!Number.isInteger(limit) || limit < 1 || limit > AMAZON_MAX_RESULTS) fail(`"limit" must be a whole number from 1 to ${AMAZON_MAX_RESULTS}.`);
+      }
+      return { type: 'amazon_research', query, limit, details: input.details !== false };
+    }
     default:
       return fail(`Unknown task type "${input.type}".`);
   }
@@ -1011,9 +1080,13 @@ async function useRegularUserAgent(page) {
 }
 
 /** New tab in the agent's browser, presented as regular Chrome (see useRegularUserAgent). */
-async function openPage(context) {
+/**
+ * New tab. The user-agent override is what Google's sign-in needs, but Amazon answers it
+ * with "Sorry! Something went wrong!" (measured), so tasks can open a tab without it.
+ */
+async function openPage(context, { regularUserAgent = true } = {}) {
   const page = await context.newPage();
-  page.uaSession = await useRegularUserAgent(page);
+  if (regularUserAgent) page.uaSession = await useRegularUserAgent(page);
   return page;
 }
 
@@ -1704,15 +1777,408 @@ async function mapsSearch(page, task, log) {
   return { query: task.query, location: task.location, leads };
 }
 
+// ---------------------------------------------------------------------------
+// Website contact extractor (no Gmail needed)
+// ---------------------------------------------------------------------------
+
+const SOCIAL_SITES = {
+  facebook: /(^|\.)facebook\.com$/,
+  instagram: /(^|\.)instagram\.com$/,
+  linkedin: /(^|\.)linkedin\.com$/,
+  x: /(^|\.)(twitter|x)\.com$/,
+  youtube: /(^|\.)youtube\.com$/,
+  tiktok: /(^|\.)tiktok\.com$/,
+};
+// Share buttons and the site builder's own pages are not the business's profile.
+const NOT_A_PROFILE = /\/(sharer|share|intent|dialog|plugins|hashtag|watch|embed|tr)(\b|\/|\.php)|[?&](u|url)=/i;
+const JUNK_EMAIL = /\.(png|jpe?g|gif|svg|webp|avif|css|js)$|@(example|domain|email|yourdomain|sentry|wixpress|sentry-next)\.|^(name|email|your|you|user|info@example)@/i;
+
+/** Reads emails, phones and links from the open page. Runs inside the browser. */
+function readContactsInPage() {
+  const EMAIL = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+  const emails = new Set();
+  const phones = new Set();
+  const links = [];
+  document.querySelectorAll('a[href]').forEach((a) => {
+    const href = a.getAttribute('href') || '';
+    if (/^mailto:/i.test(href)) {
+      try {
+        decodeURIComponent(href.slice(7).split('?')[0]).split(/[,;]/).forEach((e) => emails.add(e.trim()));
+      } catch {
+        /* bad encoding */
+      }
+    } else if (/^tel:/i.test(href)) {
+      phones.add(href.slice(4).replace(/%20/g, ' ').trim());
+    } else if (/^https?:/i.test(a.href)) {
+      links.push({ href: a.href, text: (a.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60) });
+    }
+  });
+  // Cloudflare hides emails as data-cfemail="<hex>" (XOR with the first byte).
+  document.querySelectorAll('[data-cfemail]').forEach((el) => {
+    const h = el.getAttribute('data-cfemail') || '';
+    const key = parseInt(h.slice(0, 2), 16);
+    let s = '';
+    for (let i = 2; i < h.length; i += 2) s += String.fromCharCode(parseInt(h.slice(i, i + 2), 16) ^ key);
+    emails.add(s);
+  });
+  const text = document.body ? document.body.innerText : '';
+  (text.match(EMAIL) || []).forEach((e) => emails.add(e));
+  // Phone numbers written as text, only when the page has no tel: links (text matches are noisier).
+  const textPhones = phones.size
+    ? []
+    : (text.match(/(?:\+\d{1,3}[\s.-]?)?(?:\(\d{2,4}\)\s?|\d{2,4}[\s.-])\d{3,4}[\s.-]\d{3,4}/g) || [])
+        .filter((p) => {
+          const digits = p.replace(/\D/g, '').length;
+          return digits >= 10 && digits <= 13;
+        })
+        .slice(0, 3);
+  const siteName = document.querySelector('meta[property="og:site_name"]');
+  return {
+    title: document.title || '',
+    siteName: siteName ? siteName.getAttribute('content') || '' : '',
+    emails: [...emails],
+    phones: [...phones, ...textPhones],
+    links,
+  };
+}
+
+/** Aborts requests of `page` to the server itself or a private network, and pictures / fonts / video. */
+async function blockPrivateHosts(page) {
+  await page.route('**/*', (route) => {
+    const url = route.request().url();
+    if (!/^(data|blob|about):/i.test(url) && !normalizeSiteUrl(url)) return route.abort('blockedbyclient');
+    // Only the text and links are needed: skipping pictures, fonts and video makes sites open much faster.
+    if (['image', 'font', 'media'].includes(route.request().resourceType())) return route.abort();
+    return route.continue();
+  });
+}
+
+/** Opens `url` and returns what it shows, or throws when the page can't be opened. */
+async function readSitePage(page, url) {
+  const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+  if (response && response.status() >= 400) throw new Error(`the site answered ${response.status()}`);
+  await page.waitForLoadState('load', { timeout: 3000 }).catch(() => {});
+  await sleep(500); // footers with contact details often render a moment later
+  return page.evaluate(readContactsInPage);
+}
+
+/**
+ * "2146127292" -> "214-612-7292", "+12146127292" -> "+1 214-612-7292". Numbers already
+ * written with spaces, dashes or brackets stay as they are.
+ */
+function formatPhone(p) {
+  const t = p.trim();
+  if (/[\s().-]/.test(t)) return t;
+  const d = t.replace(/\D/g, '');
+  if (d.length === 10) return `${d.slice(0, 3)}-${d.slice(3, 6)}-${d.slice(6)}`;
+  if (d.length === 11 && d[0] === '1') return `+1 ${d.slice(1, 4)}-${d.slice(4, 7)}-${d.slice(7)}`;
+  return t;
+}
+
+/** Keeps real, unique emails (lowercase) and phones (unique by their digits). */
+function cleanContacts(emails, phones) {
+  const okEmails = [...new Set(emails.map((e) => e.toLowerCase().replace(/^mailto:/, '').replace(/[.,;:]+$/, '')))]
+    .filter((e) => /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/.test(e) && !JUNK_EMAIL.test(e))
+    .slice(0, 10);
+  const byDigits = new Map();
+  phones.forEach((p) => {
+    const digits = p.replace(/\D/g, '');
+    if (digits.length >= 7 && digits.length <= 15 && !byDigits.has(digits.slice(-10))) byDigits.set(digits.slice(-10), formatPhone(p));
+  });
+  return { emails: okEmails, phones: [...byDigits.values()].slice(0, 5) };
+}
+
+/**
+ * Visits each website (home page, then its contact page) and collects emails, phone
+ * numbers, social profiles and the contact page link. One site after the other: Chrome
+ * slows down background tabs so much that parallel tabs were measured 2x slower.
+ */
+async function websiteContacts(page, task, log) {
+  await blockPrivateHosts(page);
+  const sites = [];
+  for (let i = 0; i < task.urls.length; i++) {
+    sites.push(await checkSite(page, task.urls[i], `${i + 1}/${task.urls.length}`, log));
+  }
+  const withEmail = sites.filter((s) => s.emails.length).length;
+  log.success(`Checked ${sites.length} website(s): ${withEmail} with an email address`);
+  return { sites };
+}
+
+/** One website for websiteContacts(). Never throws: problems end up in `site.error`. */
+async function checkSite(page, url, label, log) {
+  const host = new URL(url).hostname.replace(/^www\./, '');
+  log.action(`${label}: opening ${host}`);
+  const site = { website: url, name: '', emails: [], phones: [], socials: {}, contactPage: '', error: '' };
+  try {
+    const home = await readSitePage(page, url);
+    const finalHost = new URL(page.url()).hostname.replace(/^www\./, '');
+    site.name = (home.siteName || home.title.split(/\s[|–—-]\s/)[0]).trim().slice(0, 120);
+    let emails = home.emails;
+    let phones = home.phones;
+    let links = home.links;
+
+    // The contact page (same site): "Contact", "Contact us", "/contact-us", "Get in touch"...
+    const contact = home.links.find((l) => {
+      try {
+        const u = new URL(l.href);
+        return u.hostname.replace(/^www\./, '') === finalHost && u.pathname !== '/' &&
+          (/contact|get-in-touch|reach-us/i.test(u.pathname) || /^(contact|contact us|get in touch|reach us)$/i.test(l.text));
+      } catch {
+        return false;
+      }
+    });
+    if (contact) {
+      site.contactPage = contact.href.split('#')[0];
+      try {
+        const more = await readSitePage(page, site.contactPage);
+        emails = emails.concat(more.emails);
+        phones = phones.concat(more.phones);
+        links = links.concat(more.links);
+      } catch {
+        // keep what the home page had
+      }
+    }
+
+    Object.assign(site, cleanContacts(emails, phones));
+    links.forEach((l) => {
+      let u;
+      try {
+        u = new URL(l.href);
+      } catch {
+        return;
+      }
+      const h = u.hostname.toLowerCase();
+      Object.keys(SOCIAL_SITES).forEach((k) => {
+        if (!site.socials[k] && SOCIAL_SITES[k].test(h) && u.pathname.length > 1 && !NOT_A_PROFILE.test(u.pathname + u.search)) {
+          // facebook.com/profile.php?id=... is only a profile with its id
+          const id = /\/profile\.php$/i.test(u.pathname) && u.searchParams.get('id');
+          site.socials[k] = id ? `${u.origin}${u.pathname}?id=${id}` : `${u.origin}${u.pathname}`.replace(/\/$/, '');
+        }
+      });
+    });
+    const found = [
+      site.emails.length && `${site.emails.length} email${site.emails.length > 1 ? 's' : ''}`,
+      site.phones.length && `${site.phones.length} phone${site.phones.length > 1 ? 's' : ''}`,
+      Object.keys(site.socials).length && `${Object.keys(site.socials).length} social`,
+    ].filter(Boolean);
+    log.info(`${host}: ${found.length ? found.join(', ') : 'no contact details found'}`);
+  } catch (err) {
+    site.error = /net::ERR_NAME_NOT_RESOLVED/.test(err.message)
+      ? 'Website not found'
+      : /Timeout/i.test(err.message)
+        ? 'The website took too long to open'
+        : /blockedbyclient|ERR_BLOCKED/i.test(err.message)
+          ? 'This address is not allowed'
+          : `Could not open it (${err.message.split('\n')[0].slice(0, 80)})`;
+    log.warn(`${host}: ${site.error}`);
+  }
+  return site;
+}
+
+// ---------------------------------------------------------------------------
+// Amazon product researcher (no Gmail needed)
+// ---------------------------------------------------------------------------
+
+const AMAZON_URL = 'https://www.amazon.com';
+
+/** Amazon shows a captcha page instead of results when it suspects a bot. */
+async function checkAmazonBlock(page) {
+  const blocked = await page
+    .locator('form[action*="validateCaptcha"], #captchacharacters')
+    .count()
+    .catch(() => 0);
+  if (blocked) {
+    throw new AgentError('SITE_BLOCKED', 'Amazon asked for a captcha (too many requests from this server). Try again in a while.');
+  }
+}
+
+/**
+ * Amazon hides prices of products it can't ship to the visitor's country, so the delivery
+ * location is set to a US ZIP code (New York, 10001) once; it stays in the user's browser
+ * profile. Best effort: if it fails, the search runs anyway (some prices may be missing).
+ */
+async function ensureUsDelivery(page, log) {
+  const where = ((await page.locator('#glow-ingress-line2').first().textContent().catch(() => '')) || '').trim();
+  if (!where || /\b\d{5}\b/.test(where)) return false;
+  log.info(`Setting Amazon's delivery location to the US (was "${where}") so prices show`);
+  try {
+    await page.goto(`${AMAZON_URL}/?language=en_US`, { waitUntil: 'domcontentloaded', timeout: CONFIG.actionTimeoutMs });
+    await sleep(1500);
+    await page.locator('#nav-global-location-popover-link, #glow-ingress-block').first().click({ timeout: 10000 });
+    await page.locator('#GLUXZipUpdateInput').waitFor({ timeout: 10000 });
+    await page.fill('#GLUXZipUpdateInput', '10001');
+    await page.locator('#GLUXZipUpdate input, #GLUXZipUpdate').first().click({ timeout: 10000 });
+    await sleep(2500);
+    await page.locator('#GLUXConfirmClose, [name="glowDoneButton"]').first().click({ timeout: 3000 }).catch(() => {});
+    await sleep(1000);
+    return true;
+  } catch {
+    log.warn('Could not set a US delivery location; some prices may be missing');
+    return false;
+  }
+}
+
+/** Reads the product cards on an Amazon search results page. Runs inside the browser. */
+function readAmazonResults(max) {
+  const price = (box) => {
+    const p = box && box.querySelector('.a-price:not(.a-text-price)');
+    if (!p) return '';
+    const whole = (p.querySelector('.a-price-whole') || {}).textContent || '';
+    const fraction = (p.querySelector('.a-price-fraction') || {}).textContent || '';
+    const symbol = (p.querySelector('.a-price-symbol') || {}).textContent || '';
+    return whole ? `${symbol}${whole.replace(/[^\d,]/g, '')}${fraction ? `.${fraction}` : ''}` : '';
+  };
+  const seen = new Set();
+  const out = [];
+  document.querySelectorAll('[data-component-type="s-search-result"][data-asin]').forEach((card) => {
+    const asin = card.getAttribute('data-asin');
+    if (!asin || seen.has(asin) || out.length >= max) return;
+    seen.add(asin);
+    const text = (sel) => ((card.querySelector(sel) || {}).textContent || '').replace(/\s+/g, ' ').trim();
+    const ratingText = text('i[class*="a-icon-star"] .a-icon-alt, span.a-icon-alt');
+    const ratingsEl = card.querySelector('[aria-label$="ratings"], [aria-label$="rating"]');
+    out.push({
+      asin,
+      title: text('h2 span') || text('h2'),
+      price: price(card),
+      rating: (ratingText.match(/^[\d.]+/) || [''])[0],
+      ratings: ratingsEl ? ratingsEl.getAttribute('aria-label').replace(/[^\d]/g, '') : '',
+      boughtPastMonth: ((card.innerText.match(/([\d.,]+K?\+?) bought in past month/i) || [])[1]) || '',
+      sponsored: /\bSponsored\b/.test(card.innerText.slice(0, 300)),
+      url: `https://www.amazon.com/dp/${asin}`,
+    });
+  });
+  return out;
+}
+
+/** Reads an Amazon product page: brand, price, rating, features, Best Sellers Rank, top reviews. */
+function readAmazonProduct() {
+  const text = (el) => (el ? el.textContent.replace(/\s+/g, ' ').trim() : '');
+  const core = document.querySelector('#corePriceDisplay_desktop_feature_div, #corePrice_feature_div, #apex_desktop');
+  const p = core && core.querySelector('.a-price:not(.a-text-price)');
+  let price = '';
+  if (p) {
+    const whole = text(p.querySelector('.a-price-whole')).replace(/[^\d,]/g, '');
+    const fraction = text(p.querySelector('.a-price-fraction'));
+    price = whole ? `${text(p.querySelector('.a-price-symbol'))}${whole}${fraction ? `.${fraction}` : ''}` : '';
+  }
+  const rank = [...document.querySelectorAll('#productDetails_detailBullets_sections1 tr, #detailBulletsWrapper_feature_div li, #prodDetails tr')]
+    .map(text)
+    .find((t) => /Best Sellers Rank/i.test(t));
+  return {
+    brand: text(document.querySelector('#bylineInfo')).replace(/^(Visit the |Brand: )/i, '').replace(/ Store$/i, ''),
+    price,
+    rating: ((document.querySelector('#acrPopover') || { getAttribute: () => '' }).getAttribute('title') || '').replace(/ out of.*/, ''),
+    ratings: text(document.querySelector('#acrCustomerReviewText')).replace(/[^\d]/g, ''),
+    features: [...document.querySelectorAll('#feature-bullets li span.a-list-item')].map(text).filter(Boolean).slice(0, 6),
+    bestSellersRank: rank ? rank.replace(/^Best Sellers Rank:?\s*/i, '').replace(/\s*\(See Top 100[^)]*\)/g, '').slice(0, 160) : '',
+    // Amazon's own AI summary of all reviews ("Customers say"), shown even when review texts need a login.
+    customersSay: text(
+      [...document.querySelectorAll('p, span, div')].find(
+        (e) => !e.children.length && e.getAttribute('data-testid') !== 'aspect-summary' && /^Customers (find|like|appreciate|say|mention|are|report|praise|have)/.test(e.textContent.trim())
+      )
+    ).slice(0, 600),
+    // "Performance (3.1K)" with a positive / negative / mixed icon
+    aspects: [...document.querySelectorAll('[data-testid="aspect-label"]')].slice(0, 10).map((l) => {
+      const holder = l.closest('button, a, li') || l.parentElement;
+      const icon = holder && holder.querySelector('[data-testid^="aspect-icon"]');
+      const m = l.textContent.trim().match(/^(.*?)\s*\(([\d.,]+K?)\)$/);
+      return {
+        name: m ? m[1] : l.textContent.trim(),
+        mentions: m ? m[2] : '',
+        sentiment: icon ? icon.getAttribute('data-testid').replace('aspect-icon-', '') : '',
+      };
+    }),
+    reviews: [...document.querySelectorAll('[data-hook="review"]')].slice(0, 8).map((r) => ({
+      stars: (text(r.querySelector('[data-hook="review-star-rating"], [data-hook="cmps-review-star-rating"]')).match(/^[\d.]+/) || [''])[0],
+      title: text(r.querySelector('[data-hook="reviewTitle"], [data-hook="review-title"] span:last-child')).slice(0, 150),
+      text: text(r.querySelector('[data-hook="reviewRichContentContainer"], [data-hook="review-body"]')).replace(/\s*Read more\s*$/i, '').slice(0, 600),
+      // "Reviewed in the United States on September 29, 2026" -> "September 29, 2026"
+      date: (text(r.querySelector('[data-hook="review-date"]')).match(/ on (.+)$/) || ['', ''])[1],
+      verified: !!r.querySelector('[data-hook="avp-badge"]'),
+    })),
+  };
+}
+
+/**
+ * Searches Amazon.com and collects up to `limit` products (title, price, rating, ratings,
+ * "bought in past month", sponsored). With `details`, also opens the top products for
+ * their brand, features, Best Sellers Rank and top reviews (the AI then compares them).
+ */
+async function amazonResearch(page, task, log) {
+  // Prices in US dollars and pages in English, wherever the server is.
+  await page.context().addCookies([
+    { name: 'i18n-prefs', value: 'USD', domain: '.amazon.com', path: '/' },
+    { name: 'lc-main', value: 'en_US', domain: '.amazon.com', path: '/' },
+  ]);
+  log.action(`Searching Amazon for "${task.query}"`);
+  const searchUrl = `${AMAZON_URL}/s?k=${encodeURIComponent(task.query)}&language=en_US`;
+  await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: CONFIG.actionTimeoutMs });
+  await checkAmazonBlock(page);
+  if (await ensureUsDelivery(page, log)) {
+    await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: CONFIG.actionTimeoutMs });
+    await checkAmazonBlock(page);
+  }
+  try {
+    await page.locator('[data-component-type="s-search-result"]').first().waitFor({ timeout: 15000 });
+  } catch {
+    await checkAmazonBlock(page);
+    if (/something went wrong/i.test(await page.title())) {
+      throw new AgentError('SITE_BLOCKED', 'Amazon refused the search ("Sorry! Something went wrong"). Try again in a while.');
+    }
+    log.success(`No products found for "${task.query}"`);
+    return { query: task.query, products: [] };
+  }
+  const products = await page.evaluate(readAmazonResults, task.limit);
+  log.info(`Found ${products.length} products${products.filter((p) => p.sponsored).length ? ` (${products.filter((p) => p.sponsored).length} sponsored)` : ''}`);
+
+  if (task.details) {
+    const top = products.slice(0, AMAZON_MAX_DETAILS);
+    log.action(`Reading features and reviews of the top ${top.length}`);
+    for (let i = 0; i < top.length; i++) {
+      const product = top[i];
+      try {
+        await page.goto(`${product.url}?language=en_US`, { waitUntil: 'domcontentloaded', timeout: CONFIG.actionTimeoutMs });
+        await checkAmazonBlock(page);
+        await page.locator('span#productTitle').waitFor({ timeout: 15000 });
+        // Reviews sit far down and load when scrolled to.
+        await page.locator('#reviewsMedley, #cm-cr-dp-review-list, #customerReviews').first().scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+        await page.locator('[data-hook="review"]').first().waitFor({ timeout: 5000 }).catch(() => {});
+        const d = await page.evaluate(readAmazonProduct);
+        product.brand = d.brand;
+        product.price = d.price || product.price;
+        product.rating = d.rating || product.rating;
+        product.ratings = d.ratings || product.ratings;
+        product.features = d.features;
+        product.bestSellersRank = d.bestSellersRank;
+        product.reviews = d.reviews;
+        product.customersSay = d.customersSay;
+        product.aspects = d.aspects;
+        const read = d.reviews.length ? `${d.reviews.length} reviews read` : d.customersSay ? "customers' summary read (reviews need an Amazon login)" : 'no reviews shown';
+        log.info(`${i + 1}. ${product.title.slice(0, 60)}${product.price ? ` · ${product.price}` : ''} · ${read}`);
+      } catch (err) {
+        if (err instanceof AgentError) throw err; // captcha: stop instead of hammering Amazon
+        log.warn(`Could not open "${product.title.slice(0, 50)}"; kept the search details`);
+      }
+    }
+  }
+  const priced = products.filter((p) => p.price).length;
+  log.success(`Collected ${products.length} product(s)${priced < products.length ? `: ${priced} with a price (no price = not sold right now)` : ''}`);
+  return { query: task.query, products };
+}
+
 const TASK_HANDLERS = {
   send_email: sendEmail,
   search_email: searchEmail,
   read_inbox: readInbox,
   maps_search: mapsSearch,
+  website_contacts: websiteContacts,
+  amazon_research: amazonResearch,
 };
 
 /** Tasks that work inside the user's Gmail (they need "Connect Gmail" first). */
-const needsGmail = (task) => task.type !== 'maps_search';
+const GMAIL_TASKS = new Set(['send_email', 'search_email', 'read_inbox']);
+const needsGmail = (task) => GMAIL_TASKS.has(task.type);
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -1768,7 +2234,7 @@ async function runBrowserAgent(input, { userId, onLog, dryRun = false, postProce
         throw new AgentError('LOGIN_REQUIRED', 'Gmail is not connected yet. Click "Connect Gmail" on the dashboard, sign in once, then retry.');
       }
       const context = await getContext(s, log);
-      page = await openPage(context);
+      page = await openPage(context, { regularUserAgent: task.type !== 'amazon_research' });
       stopScreencast = await startScreencast(page, log, s);
       if (needsGmail(task)) {
         await openGmail(page, log);
