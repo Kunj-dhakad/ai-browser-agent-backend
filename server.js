@@ -603,7 +603,15 @@ function runSummary(run) {
     createdAt: new Date(run.createdAt).toISOString(),
     durationMs: run.report ? run.report.durationMs : undefined,
     error: run.report && run.report.error ? run.report.error : undefined,
+    prices: priceSummary(run), // price checks only: what the price history needs
   };
+}
+
+/** For a finished price check: [{ url, title, value, currency, inStock }] (small, so lists stay light). */
+function priceSummary(run) {
+  const result = run.task && run.task.type === 'price_check' && run.report && run.report.result;
+  if (!result || !Array.isArray(result.items)) return undefined;
+  return result.items.map(({ url, title, value, currency, inStock }) => ({ url, title: (title || '').slice(0, 120), value, currency, inStock }));
 }
 
 function pruneRuns() {

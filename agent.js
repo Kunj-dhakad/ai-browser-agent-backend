@@ -65,6 +65,7 @@ const MAPS_MAX_RESULTS = 100; // Google Maps lists stop around 120 places per se
 const CONTACTS_MAX_SITES = 50; // websites per contact-extractor task (~3-8 s each)
 const AMAZON_MAX_RESULTS = 30; // products per Amazon research task (one search page)
 const AMAZON_MAX_DETAILS = 10; // of those, product pages opened for features and reviews (~5 s each)
+const PRICE_MAX_ITEMS = 20; // product links per price watch (~5 s each)
 
 /**
  * "example.com", "www.example.com/contact" or "https://example.com" -> a full https URL, or
@@ -673,6 +674,31 @@ function validateTask(input) {
         if (!Number.isInteger(limit) || limit < 1 || limit > AMAZON_MAX_RESULTS) fail(`"limit" must be a whole number from 1 to ${AMAZON_MAX_RESULTS}.`);
       }
       return { type: 'amazon_research', query, limit, details: input.details !== false };
+    }
+    case 'price_check': {
+      if (!Array.isArray(input.items) || !input.items.length) fail('Add at least one product link.');
+      if (input.items.length > PRICE_MAX_ITEMS) fail(`At most ${PRICE_MAX_ITEMS} products per price watch.`);
+      const seen = new Set();
+      const items = [];
+      input.items.forEach((it, i) => {
+        const raw = str(it && it.url, `items[${i}].url`, 1000);
+        if (!raw) return;
+        const url = normalizeSiteUrl(raw);
+        if (!url) fail(`"${raw.slice(0, 80)}" is not a public product link.`);
+        let target = null;
+        if (it.target !== undefined && it.target !== null && it.target !== '') {
+          target = Number(String(it.target).replace(/[$,\s]/g, '')); // "$1,299.50" -> 1299.5
+          if (!Number.isFinite(target) || target <= 0) fail(`The target price for product ${i + 1} must be a number above 0.`);
+        }
+        if (!seen.has(url)) {
+          seen.add(url);
+          items.push({ url, target });
+        }
+      });
+      if (!items.length) fail('Add at least one product link.');
+      const alertEmail = str(input.alertEmail, 'alertEmail', 254);
+      if (alertEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(alertEmail)) fail('The alert email address is not valid.');
+      return { type: 'price_check', items, alertEmail };
     }
     default:
       return fail(`Unknown task type "${input.type}".`);
@@ -1843,12 +1869,12 @@ function readContactsInPage() {
 }
 
 /** Aborts requests of `page` to the server itself or a private network, and pictures / fonts / video. */
-async function blockPrivateHosts(page) {
+async function blockPrivateHosts(page, { skipMedia = true } = {}) {
   await page.route('**/*', (route) => {
     const url = route.request().url();
     if (!/^(data|blob|about):/i.test(url) && !normalizeSiteUrl(url)) return route.abort('blockedbyclient');
     // Only the text and links are needed: skipping pictures, fonts and video makes sites open much faster.
-    if (['image', 'font', 'media'].includes(route.request().resourceType())) return route.abort();
+    if (skipMedia && ['image', 'font', 'media'].includes(route.request().resourceType())) return route.abort();
     return route.continue();
   });
 }
@@ -2167,6 +2193,202 @@ async function amazonResearch(page, task, log) {
   return { query: task.query, products };
 }
 
+// ---------------------------------------------------------------------------
+// Price monitor (Gmail only for the optional alert email)
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads a product's price from a shop page. Runs inside the browser. In order:
+ * schema.org Product data (JSON-LD), price meta tags, microdata, and as a last resort the
+ * largest "$12.34" shown near the top of the page (source "page": less certain).
+ */
+function readShopPrice() {
+  const meta = (sel) => (document.querySelector(sel) || {}).content || '';
+  const title = meta('meta[property="og:title"]') || document.title || '';
+  const found = [];
+  const walk = (node) => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (/Product/i.test([].concat(node['@type'] || []).join(','))) found.push(node);
+    if (node['@graph']) walk(node['@graph']);
+  };
+  document.querySelectorAll('script[type="application/ld+json"]').forEach((s) => {
+    try {
+      walk(JSON.parse(s.textContent));
+    } catch {
+      /* broken JSON on the page */
+    }
+  });
+  for (const p of found) {
+    const offers = [].concat(p.offers || []).flatMap((o) => (o && o.offers ? [].concat(o.offers) : [o]));
+    const o = offers.find((x) => x && (x.price || x.lowPrice || (x.priceSpecification && x.priceSpecification.price)));
+    if (o) {
+      return {
+        title: p.name || title,
+        amount: String(o.price || o.lowPrice || o.priceSpecification.price),
+        currency: o.priceCurrency || (o.priceSpecification && o.priceSpecification.priceCurrency) || '',
+        availability: String(o.availability || ''),
+        source: 'product data',
+      };
+    }
+  }
+  const metaPrice = meta('meta[property="product:price:amount"]') || meta('meta[property="og:price:amount"]') || meta('meta[itemprop="price"]');
+  if (metaPrice) {
+    return {
+      title,
+      amount: metaPrice,
+      currency: meta('meta[property="product:price:currency"]') || meta('meta[property="og:price:currency"]') || meta('meta[itemprop="priceCurrency"]'),
+      availability: meta('meta[property="product:availability"]') || meta('meta[property="og:availability"]'),
+      source: 'product data',
+    };
+  }
+  const itemprop = document.querySelector('[itemprop="price"]');
+  if (itemprop) {
+    return { title, amount: itemprop.getAttribute('content') || itemprop.textContent.trim(), currency: meta('[itemprop="priceCurrency"]'), availability: '', source: 'product data' };
+  }
+  // Last resort: the biggest price-looking text in the top part of the page (not crossed out).
+  const RE = /^(?:US)?\s?([$€£₹])\s?(\d{1,3}(?:,\d{3})*(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)$/;
+  let best = null;
+  for (const el of document.querySelectorAll('body *')) {
+    if (!(el instanceof HTMLElement) || el.children.length > 3) continue; // skips SVG and other non-HTML nodes
+    const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+    if (!t || t.length > 16) continue;
+    const m = t.match(RE);
+    if (!m) continue;
+    const r = el.getBoundingClientRect();
+    if (!r.width || !r.height || r.top < 0 || r.top > 1400) continue;
+    const st = getComputedStyle(el);
+    if (st.visibility === 'hidden' || st.textDecorationLine.includes('line-through')) continue;
+    const size = parseFloat(st.fontSize) || 0;
+    if (!best || size > best.size) best = { size, symbol: m[1], amount: m[2] };
+  }
+  if (best) {
+    const currency = { $: 'USD', '€': 'EUR', '£': 'GBP', '₹': 'INR' }[best.symbol] || '';
+    return { title, amount: best.amount, currency, availability: '', source: 'page' };
+  }
+  return { title, amount: '', currency: '', availability: '', source: '' };
+}
+
+/** "$1,299.00" / "1299" -> 1299 (US number format). */
+const priceValue = (s) => {
+  const n = parseFloat(String(s || '').replace(/[^\d.]/g, ''));
+  return Number.isFinite(n) ? n : null;
+};
+const SYMBOL = { USD: '$', EUR: '€', GBP: '£', INR: '₹', CAD: 'CA$', AUD: 'A$' };
+const showPrice = (value, currency) => (value === null ? '' : `${SYMBOL[currency] || (currency ? `${currency} ` : '$')}${value.toFixed(2)}`);
+
+/** Reads one product link: { title, value, currency, inStock, source } or throws. */
+async function readProductPrice(page, url, state, log) {
+  const host = new URL(url).hostname;
+  if (/(^|\.)amazon\.com$/.test(host)) {
+    if (!state.amazonReady) {
+      await page.context().addCookies([
+        { name: 'i18n-prefs', value: 'USD', domain: '.amazon.com', path: '/' },
+        { name: 'lc-main', value: 'en_US', domain: '.amazon.com', path: '/' },
+      ]);
+      await page.goto(`${AMAZON_URL}/?language=en_US`, { waitUntil: 'domcontentloaded', timeout: CONFIG.actionTimeoutMs });
+      await checkAmazonBlock(page);
+      await ensureUsDelivery(page, log);
+      state.amazonReady = true;
+    }
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: CONFIG.actionTimeoutMs });
+    await checkAmazonBlock(page);
+    await page.locator('span#productTitle').waitFor({ timeout: 15000 });
+    const d = await page.evaluate(() => {
+      const t = (sel) => ((document.querySelector(sel) || {}).textContent || '').replace(/\s+/g, ' ').trim();
+      const core = document.querySelector('#corePriceDisplay_desktop_feature_div, #corePrice_feature_div, #apex_desktop');
+      const p = core && core.querySelector('.a-price:not(.a-text-price)');
+      const whole = p ? ((p.querySelector('.a-price-whole') || {}).textContent || '').replace(/[^\d,]/g, '') : '';
+      const fraction = p ? ((p.querySelector('.a-price-fraction') || {}).textContent || '') : '';
+      return { title: t('span#productTitle'), amount: whole ? `${whole}.${fraction || '00'}` : '', availability: t('#availability') };
+    });
+    return {
+      title: d.title,
+      value: priceValue(d.amount),
+      currency: 'USD',
+      inStock: d.availability ? !/unavailable|out of stock/i.test(d.availability) : null,
+      source: 'amazon',
+    };
+  }
+  const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+  if (response && response.status() >= 400) throw new Error(`the shop answered ${response.status()}`);
+  await page.waitForLoadState('load', { timeout: 4000 }).catch(() => {});
+  await sleep(1200); // prices are often filled in by script
+  if (/robot or human|are you a human|captcha|access denied|just a moment|attention required/i.test(await page.title())) {
+    throw new Error('the shop blocked automated visits');
+  }
+  const d = await page.evaluate(readShopPrice);
+  return {
+    title: d.title,
+    value: priceValue(d.amount),
+    currency: d.currency || 'USD',
+    inStock: d.availability ? /InStock|in stock|LimitedAvailability|PreOrder/i.test(d.availability) : null,
+    source: d.source,
+  };
+}
+
+/**
+ * Checks the current price of each product link and, when a price is at or below its
+ * target, emails an alert from the user's Gmail (if `alertEmail` is set and Gmail is connected).
+ */
+async function priceCheck(page, task, log) {
+  await blockPrivateHosts(page, { skipMedia: false });
+  const state = {};
+  const items = [];
+  for (let i = 0; i < task.items.length; i++) {
+    const { url, target } = task.items[i];
+    const host = new URL(url).hostname.replace(/^www\./, '');
+    log.action(`${i + 1}/${task.items.length}: checking ${host}`);
+    const item = { url, title: '', price: '', value: null, currency: '', inStock: null, target, hit: false, source: '', error: '' };
+    try {
+      const d = await readProductPrice(page, url, state, log);
+      Object.assign(item, { title: (d.title || '').trim().slice(0, 200), value: d.value, currency: d.currency, inStock: d.inStock, source: d.source });
+      item.price = showPrice(d.value, d.currency);
+      item.hit = target !== null && d.value !== null && d.value <= target;
+      if (d.value === null) item.error = 'No price found on this page';
+      log.info(`${host}: ${item.price || 'no price found'}${item.inStock === false ? ' (out of stock)' : ''}${item.hit ? ` · at or below your target ${showPrice(target, d.currency)}` : ''}`);
+    } catch (err) {
+      if (err instanceof AgentError && err.code === 'SITE_BLOCKED') item.error = 'Amazon asked for a captcha; try again later';
+      else if (/ERR_NAME_NOT_RESOLVED/.test(err.message)) item.error = 'Website not found';
+      else if (/blockedbyclient|ERR_BLOCKED/i.test(err.message)) item.error = 'This address is not allowed';
+      else item.error = `Could not read the price (${err.message.split('\n')[0].slice(0, 80)})`;
+      log.warn(`${host}: ${item.error}`);
+    }
+    items.push(item);
+  }
+
+  const hits = items.filter((it) => it.hit);
+  let alerted = '';
+  if (hits.length && task.alertEmail) {
+    let gmail;
+    try {
+      log.action(`Emailing a price alert to ${task.alertEmail}`);
+      gmail = await openPage(page.context()); // Gmail needs the usual browser identity
+      await openGmail(gmail, log);
+      const lines = hits.map((h) => `- ${h.title || h.url}\n  Now ${h.price} (your target: ${showPrice(h.target, h.currency)})\n  ${h.url}`);
+      await sendEmail(
+        gmail,
+        {
+          type: 'send_email',
+          to: [task.alertEmail],
+          subject: hits.length === 1 ? `Price drop: ${(hits[0].title || 'your product').slice(0, 60)} is now ${hits[0].price}` : `Price drop on ${hits.length} products you watch`,
+          body: `Hello,\n\nThese products are at or below your target price:\n\n${lines.join('\n\n')}\n\nSent by your AI Browser Agent price monitor.`,
+          sendMode: 'send',
+        },
+        log
+      );
+      alerted = task.alertEmail;
+    } catch (err) {
+      log.warn(`Price alert email not sent: ${err.code === 'LOGIN_REQUIRED' ? 'Gmail is not connected' : err.message.split('\n')[0].slice(0, 120)}`);
+    } finally {
+      if (gmail && !gmail.isClosed()) await gmail.close().catch(() => {});
+    }
+  }
+  const found = items.filter((it) => it.value !== null).length;
+  log.success(`Checked ${items.length} product(s): ${found} with a price${hits.length ? `, ${hits.length} at or below target` : ''}`);
+  return { items, alerted };
+}
+
 const TASK_HANDLERS = {
   send_email: sendEmail,
   search_email: searchEmail,
@@ -2174,6 +2396,7 @@ const TASK_HANDLERS = {
   maps_search: mapsSearch,
   website_contacts: websiteContacts,
   amazon_research: amazonResearch,
+  price_check: priceCheck,
 };
 
 /** Tasks that work inside the user's Gmail (they need "Connect Gmail" first). */
@@ -2234,7 +2457,7 @@ async function runBrowserAgent(input, { userId, onLog, dryRun = false, postProce
         throw new AgentError('LOGIN_REQUIRED', 'Gmail is not connected yet. Click "Connect Gmail" on the dashboard, sign in once, then retry.');
       }
       const context = await getContext(s, log);
-      page = await openPage(context, { regularUserAgent: task.type !== 'amazon_research' });
+      page = await openPage(context, { regularUserAgent: task.type !== 'amazon_research' && task.type !== 'price_check' });
       stopScreencast = await startScreencast(page, log, s);
       if (needsGmail(task)) {
         await openGmail(page, log);

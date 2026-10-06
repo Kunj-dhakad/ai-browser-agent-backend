@@ -203,6 +203,7 @@ function planToTask(plan) {
 function describeTask(task) {
   if (task.type === 'send_email') return `${task.sendMode === 'draft' ? 'Save a draft' : 'Send an email'} to ${task.to.join(', ')}`;
   if (task.type === 'search_email') return `Search Gmail for "${task.query}"`;
+  if (task.type === 'price_check') return `Check the price of ${task.items.length} product(s)`;
   if (task.type === 'amazon_research') return `Research ${task.limit} Amazon products: ${task.query}`;
   if (task.type === 'website_contacts') return `Find contact details on ${task.urls.length} website(s)`;
   if (task.type === 'maps_search') return `Find ${task.limit} businesses on Google Maps: ${task.query}${task.location ? ` in ${task.location}` : ''}`;
