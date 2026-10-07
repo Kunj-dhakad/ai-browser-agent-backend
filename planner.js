@@ -1,20 +1,4 @@
-/**
- * planner.js
- * ---------------------------------------------------------------------------
- * The "brain" of the agent, powered by OpenAI.
- *
- *   planTask(prompt, userId) Natural language (English / Hindi / Hinglish, even rough notes) -> a Gmail
- *                         task. Writes a complete English email (subject + body, signed with the
- *                         user's Gmail account name, or else their account name) so the user
- *                         only has to say what they want.
- *   createSummarizer(...) Short English summary of search / inbox results.
- *
- * The browser work itself stays in agent.js (Playwright): OpenAI only decides
- * *what* to do and writes text, it never clicks anything.
- *
- * Without OPENAI_API_KEY the planner falls back to the rule-based parser in agent.js.
- * ---------------------------------------------------------------------------
- */
+
 
 require('dotenv').config();
 
@@ -81,7 +65,7 @@ function systemPrompt(name) {
     : 'End with a short closing line such as "Best regards," or "Thanks,". Do not add any name or placeholder like [Your Name] (Gmail adds the signature).';
 
   return `You turn a user's request into ONE Gmail task for a browser agent, doing as much as possible yourself so the user types as little as possible.
-The user may write in English, Hindi or Hinglish, often briefly or roughly. You always answer in English.
+The user may write in English, often briefly or roughly. You always answer in English.
 Today is ${now.toDateString()}.
 
 The agent can ONLY do these actions in the user's own Gmail:
@@ -234,8 +218,7 @@ async function planTask(prompt, userId) {
       response_format: { type: 'json_schema', json_schema: { name: 'gmail_task', strict: true, schema: PLAN_SCHEMA } },
     });
   } catch (err) {
-    // Some OpenAI-compatible services don't support strict JSON schemas. Retry with plain JSON mode
-    // and describe the fields in the prompt instead; the answer is still checked below.
+   
     if (!(err instanceof APIError && err.status === 400)) throw toAgentError(err);
     try {
       completion = await openai.chat.completions.create({

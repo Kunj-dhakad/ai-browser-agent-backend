@@ -1,19 +1,4 @@
-/**
- * agent.js
- * ---------------------------------------------------------------------------
- * Playwright-powered browser agent.
- *
- *   runBrowserAgent(prompt, { onLog })
- *     1. Interprets a natural-language prompt into a structured task.
- *     2. Opens Gmail in a *persistent* Chromium profile (login survives restarts).
- *     3. Executes the task (compose + send, search, read inbox) typing like a human.
- *     4. Returns step-by-step logs (and streams each one through `onLog`).
- *
- * CLI helpers:
- *   node agent.js --login            Open a visible browser so you can sign in to Google once.
- *   node agent.js "<prompt>"         Run a single command from the terminal.
- * ---------------------------------------------------------------------------
- */
+
 
 require('dotenv').config();
 
@@ -37,11 +22,9 @@ const envInt = (value, fallback) => {
 
 const CONFIG = {
   headless: envBool(process.env.HEADLESS, true),
-  // Multi-user: each user gets their own browser profile folder under PROFILES_DIR.
   profilesDir: path.resolve(process.env.PROFILES_DIR || './data/profiles'),
   maxBrowsers: Math.max(1, envInt(process.env.MAX_BROWSERS, 10)), // browsers open at the same time
   idleCloseMs: Math.max(1, envInt(process.env.BROWSER_IDLE_MINUTES, 5)) * 60 * 1000, // close an unused browser after this
-  // The single-user profile from before multi-user mode (moved to the first admin; see scripts/add-user.js).
   legacyProfileDir: path.resolve(process.env.USER_DATA_DIR || './.browser-profile'),
   channel: process.env.BROWSER_CHANNEL || undefined, // e.g. "chrome" to use installed Google Chrome
   typingDelayMs: envInt(process.env.TYPING_DELAY_MS, 80),
@@ -49,14 +32,13 @@ const CONFIG = {
   actionTimeoutMs: envInt(process.env.ACTION_TIMEOUT_MS, 30000),
   dryRun: envBool(process.env.DRY_RUN, false),
   screenshotDir: path.resolve('./screenshots'),
-  // 16:9-ish like a laptop screen, so the dashboard preview fills its panel with no empty bars.
+  
   viewport: { width: 1366, height: 768 },
-  // Live browser preview (Chrome DevTools screencast -> SSE -> dashboard)
   screencast: {
     enabled: envBool(process.env.SCREENCAST_ENABLED, true),
-    quality: envInt(process.env.SCREENCAST_QUALITY, 80), // JPEG quality 1-100 (below ~75 small text gets blurry)
-    maxWidth: envInt(process.env.SCREENCAST_MAX_WIDTH, 1366), // = viewport width: send frames at native size
-    maxFps: envInt(process.env.SCREENCAST_MAX_FPS, 8), // per viewer, enforced in server.js
+    quality: envInt(process.env.SCREENCAST_QUALITY, 80), 
+    maxWidth: envInt(process.env.SCREENCAST_MAX_WIDTH, 1366), 
+    maxFps: envInt(process.env.SCREENCAST_MAX_FPS, 8), 
   },
 };
 
@@ -66,13 +48,9 @@ const CONTACTS_MAX_SITES = 50; // websites per contact-extractor task (~3-8 s ea
 const AMAZON_MAX_RESULTS = 30; // products per Amazon research task (one search page)
 const AMAZON_MAX_DETAILS = 10; // of those, product pages opened for features and reviews (~5 s each)
 const PRICE_MAX_ITEMS = 20; // product links per price watch (~5 s each)
+const QA_MAX_STEPS = 60; // AI tester actions per website test (each one is an AI request)
 
-/**
- * "example.com", "www.example.com/contact" or "https://example.com" -> a full https URL, or
- * null when it isn't a public website: the agent's browser runs on our server, so it must
- * never be pointed at the server itself or the private network (e.g. the cloud metadata
- * address 169.254.169.254).
- */
+
 function normalizeSiteUrl(raw) {
   let s = String(raw).trim();
   if (!s) return null;
@@ -201,18 +179,12 @@ function normalizePrompt(prompt) {
     .trim();
 }
 
-/**
- * Extracts the value that follows one of `keywords`, e.g.
- *   subject 'Meeting'            -> Meeting
- *   message "Let's catch up"     -> Let's catch up   (apostrophes are fine)
- *   saying see you at 4          -> see you at 4     (unquoted fallback)
- */
+
 function extractField(text, keywords) {
   const kw = `(?:${keywords.map(escapeRe).join('|')})`;
   const sep = String.raw`\s*(?:of|as|is|=|:|-)?\s*`;
 
   // 1) Quoted value. The closing quote only counts if it's followed by the end of
-  //    the sentence or by another field, so "Let's" doesn't end the value early.
   const quoted = new RegExp(
     String.raw`\b${kw}\b${sep}(["'])([\s\S]*?)\1(?=\s*[,.;!?]?\s*(?:$|and\b|with\b|then\b|${FIELD_STOP}\b))`,
     'i'
@@ -220,9 +192,6 @@ function extractField(text, keywords) {
   const q = text.match(quoted);
   if (q) return q[2].trim();
 
-  // 2) Unquoted value: runs until the next field keyword or the end.
-  //    We take the *last* sensible match because "Send a message to John..."
-  //    uses the word "message" as a noun rather than as a field label.
   const unquoted = new RegExp(
     String.raw`\b${kw}\b${sep}([^"'][\s\S]*?)(?=\s*[,;]?\s*(?:and\s+|with\s+)?(?:the\s+|a\s+)?${FIELD_STOP}\b|\s*$)`,
     'gi'
@@ -235,14 +204,11 @@ function extractField(text, keywords) {
 
 /** Finds recipients: email addresses or contact names after "to" (or "email John ..."). */
 function extractRecipients(text) {
-  // Remove quoted segments so words inside the subject/body are never mistaken for recipients,
-  // and ignore everything after "that / saying / about …" (the message itself: "moved to 4 PM"
-  // must not turn "4 PM" into a recipient).
+  
   const unquotedText = text
     .replace(/(["'])(?:(?!\1).)*\1(?=\s|$|[,.;])/g, ' ')
     .replace(/\s\b(?:that|saying|to say|(?:to\s+)?tell(?:ing)?\s+(?:him|her|them)|let(?:ting)?\s+(?:him|her|them)\s+know|about|regarding|ki)\b[\s\S]*$/i, ' ');
 
-  // Any email address in the command part is a recipient: "Email a@b.com …", "… to a@b.com and c@d.com".
   const addresses = unquotedText.match(EMAIL_RE);
   if (addresses) return [...new Set(addresses)];
 
@@ -250,7 +216,6 @@ function extractRecipients(text) {
     unquotedText.match(
       /\bto\s+([\s\S]+?)(?=\s+(?:with|saying|about|regarding|that|and\s+(?:say|tell|ask|the\s+subject|subject|message|body))\b|\s*[,;:]\s*(?:subject|message|body|saying)\b|\s+(?:subject|message|body)\b|[.!?]?\s*$)/i
     ) ||
-    // "Email John saying hi" / "mail john@x.com ..."
     unquotedText.match(
       /^(?:please\s+)?(?:e-?mail|mail|message|tell|inform|notify|let)\s+(?!to\b|an?\b|the\b)([\s\S]+?)(?=\s+(?:with|saying|about|regarding|that|subject|message|body|know)\b|[.!?]?\s*$)/i
     );
@@ -260,22 +225,17 @@ function extractRecipients(text) {
   const emails = segment.match(EMAIL_RE);
   if (emails) return [...new Set(emails)];
 
-  // Contact names: "John", "John Smith", "John and Sarah", "John, Sarah"
   return segment
     .split(/\s*(?:,|\band\b|&)\s*/i)
     .map((n) => n.replace(/^(?:my|our)\s+/i, '').trim())
     .filter((n) => n && n.length <= 60);
 }
 
-// --- Filling in a missing subject / message (used when the AI is off) ---------
 
 const capitalize = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
-// The message itself: "that …", "saying …", "tell him …", "let her know …", "ki …".
 const SAID_RE = /\b(?:that|saying|to say|(?:to\s+)?tell(?:ing)?\s+(?:him|her|them)|let(?:ting)?\s+(?:him|her|them)\s+know|ki)\b\s+([\s\S]+)$/i;
-// "Tell / inform / notify <recipient> <message>" without "that": everything after the recipient.
 const TELL_RE = /^(?:please\s+)?(?:tell|inform|notify)\s+(?:[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|\S+)\s+(?!about\b|regarding\b)([\s\S]+)$/i;
-// Only the topic: "about …", "regarding …".
 const ABOUT_RE = /\b(?:about|regarding)\b\s+([\s\S]+)$/i;
 
 const tailOf = (text, re) => {
@@ -283,7 +243,6 @@ const tailOf = (text, re) => {
   return m ? m[1].trim().replace(/^["']|["']$/g, '').replace(/[\s.]+$/, '') : '';
 };
 
-/** Fallback topic: the sentence minus the command words and recipients ("a leave request for this Friday"). */
 function extractTopic(text, recipients) {
   // (?=\s) keeps "a" in "Email a@b.com" from being taken as the article "a".
   let t = text.replace(/^(?:please\s+)?(?:send|compose|write|draft|e-?mail|mail)\b(?:\s+(?:an?|the)(?=\s))?(?:\s+(?:e-?mail|mail|message|note)\b)?/i, '');
@@ -308,11 +267,7 @@ const NOT_A_NAME = new Set(
   'hr info admin support contact sales team office hello help mail noreply no reply jobs careers billing accounts account service services enquiry enquiries inquiry marketing boss manager ceo hiring recruitment'.split(' ')
 );
 
-/**
- * First name for the greeting: "rahul.sharma@x.com" -> "Rahul", "John Smith" -> "John".
- * Only when it clearly looks like a first name: a long run of letters like "paretarenu6@"
- * may be two names joined, so that gets "Hello," rather than a wrong guess.
- */
+
 function greetingName(recipients) {
   if (recipients.length !== 1) return '';
   const r = recipients[0];
@@ -327,11 +282,7 @@ function greetingName(recipients) {
   return looksLikeName && !NOT_A_NAME.has(token) ? capitalize(token) : '';
 }
 
-/**
- * What kind of email it is decides the helpful follow-up lines, the closing and a subject prefix.
- * The lines only add polite, generic next steps. They never add facts the user didn't give.
- * Order matters: the first match wins.
- */
+
 const MEETING = String.raw`(?:meeting|call|sync|stand-?up|discussion|appointment|interview|session|demo|class)`;
 const CHANGED = String.raw`(?:moved|shifted|rescheduled|postponed|changed|preponed|pushed|delayed)`;
 const INTENTS = [
@@ -407,11 +358,7 @@ function lowerFirst(s) {
 
 const endSentence = (s) => (/[.!?]$/.test(s) ? s : `${s}.`);
 
-/**
- * Light clean-up of quickly typed text (no AI): common short forms and typos, "i" -> "I",
- * "i am leave" -> "I am on leave", and a sentence break before "I am / I will …".
- * It can't truly rewrite broken English; that needs the AI (see planner.js).
- */
+
 function tidy(text) {
   let t = ` ${text.trim()} `
     .replace(/\s+/g, ' ')
@@ -436,12 +383,7 @@ function tidy(text) {
     .join(' ');
 }
 
-/**
- * Writes a complete email around the user's words: greeting, a friendly opener, the message,
- * helpful next steps for this kind of email, a closing line and the sign-off.
- * content: { message } the user's own words (kept as a sentence), { said } what to tell them
- * ("that …"), { topic } what it is about, or { subject } only.
- */
+
 function composeBody(recipients, content) {
   const message = content.message && tidy(content.message);
   const said = content.said && tidy(content.said);
@@ -700,6 +642,19 @@ function validateTask(input) {
       if (alertEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(alertEmail)) fail('The alert email address is not valid.');
       return { type: 'price_check', items, alertEmail };
     }
+    case 'qa_test': {
+      const raw = str(input.url, 'url', 1000);
+      if (!raw) fail('Add the website address to test.');
+      const url = normalizeSiteUrl(raw);
+      if (!url) fail(`"${raw.slice(0, 80)}" is not a public website address.`);
+      const instructions = str(input.instructions, 'instructions', 2000);
+      let maxSteps = 30;
+      if (input.maxSteps !== undefined && input.maxSteps !== null && input.maxSteps !== '') {
+        maxSteps = Number(input.maxSteps);
+        if (!Number.isInteger(maxSteps) || maxSteps < 5 || maxSteps > QA_MAX_STEPS) fail(`"maxSteps" must be a whole number from 5 to ${QA_MAX_STEPS}.`);
+      }
+      return { type: 'qa_test', url, instructions, maxSteps, mobile: input.mobile === true };
+    }
     default:
       return fail(`Unknown task type "${input.type}".`);
   }
@@ -937,21 +892,15 @@ function getAccount(userId) {
   return u && u.gmail_email ? { name: u.gmail_name, email: u.gmail_email } : null;
 }
 
-/** Name under "Best regards,": the Gmail account's name (or the user's name as a fallback). */
 function senderName(userId) {
   const u = userId && userStore.get(userId);
   if (!u) return '';
   return (u.gmail_name || u.name || '').trim();
 }
 
-/** "kunj dhakad" -> "Kunj Dhakad" (names typed all lowercase); other names are kept as they are. */
 const tidyName = (n) => (n === n.toLowerCase() ? n.replace(/\b[a-z]/g, (c) => c.toUpperCase()) : n);
 
-/**
- * Reads the account from Gmail's profile button. Its label looks like
- * "Google Account: Kunj Dhakad (kunj@gmail.com)" (the words vary with the Gmail language,
- * the "Name (address)" part doesn't). Never throws; a miss just keeps the old value.
- */
+
 async function readAccount(page, s) {
   try {
     const label = await page
@@ -967,10 +916,7 @@ async function readAccount(page, s) {
 
 const CLOSING_LINE = /^(?:best regards|kind regards|warm regards|regards|best wishes|best|thanks|thank you|many thanks|thanks again|sincerely|yours sincerely|yours truly|cheers)[,!.]?$/i;
 
-/**
- * Puts the sender's name under the closing line ("Best regards," -> "Best regards,\nKunj Dhakad")
- * when the email ends with a closing but no name. Leaves everything else untouched.
- */
+
 function signBody(body, name) {
   if (!name || !body) return body;
   const lines = body.replace(/\s+$/, '').split('\n');
@@ -2397,6 +2343,8 @@ const TASK_HANDLERS = {
   website_contacts: websiteContacts,
   amazon_research: amazonResearch,
   price_check: priceCheck,
+  // AI-driven website tester (qa-agent.js, OpenAI Agents SDK); loaded only when used.
+  qa_test: (page, task, log) => require('./qa-agent').runQaAgent(page, task, log, { normalizeSiteUrl, blockPrivateHosts, AgentError }),
 };
 
 /** Tasks that work inside the user's Gmail (they need "Connect Gmail" first). */
@@ -2457,7 +2405,7 @@ async function runBrowserAgent(input, { userId, onLog, dryRun = false, postProce
         throw new AgentError('LOGIN_REQUIRED', 'Gmail is not connected yet. Click "Connect Gmail" on the dashboard, sign in once, then retry.');
       }
       const context = await getContext(s, log);
-      page = await openPage(context, { regularUserAgent: task.type !== 'amazon_research' && task.type !== 'price_check' });
+      page = await openPage(context, { regularUserAgent: !['amazon_research', 'price_check', 'qa_test'].includes(task.type) });
       stopScreencast = await startScreencast(page, log, s);
       if (needsGmail(task)) {
         await openGmail(page, log);

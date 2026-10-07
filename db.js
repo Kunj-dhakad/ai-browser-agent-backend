@@ -1,13 +1,4 @@
-/**
- * db.js
- * ---------------------------------------------------------------------------
- * Small SQLite database (Node's built-in `node:sqlite`, no extra package) for
- * multi-user mode: users, their Gmail connection and daily usage.
- *
- * File: data/app.db (DB_FILE). Runs stay in memory (see server.js); schedules
- * stay in data/schedules.json with a userId on each one.
- * ---------------------------------------------------------------------------
- */
+
 
 require('dotenv').config();
 
@@ -16,10 +7,6 @@ const path = require('path');
 const crypto = require('crypto');
 const { DatabaseSync } = withoutSqliteWarning(() => require('node:sqlite'));
 
-/**
- * Node 22-24 prints "ExperimentalWarning: SQLite is an experimental feature" on load. It is
- * harmless, but it lands in the middle of prompts (npm run add-user) and logs, so skip it.
- */
 function withoutSqliteWarning(load) {
   const emitWarning = process.emitWarning;
   process.emitWarning = (warning, ...rest) => {

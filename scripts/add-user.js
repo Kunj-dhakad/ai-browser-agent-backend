@@ -1,19 +1,4 @@
-/**
- * scripts/add-user.js
- * ---------------------------------------------------------------------------
- * Creates a user from the command line (the first admin, or when the web admin
- * page isn't reachable). Other users are easier to add from Admin -> Users.
- *
- *   npm run add-admin              asks for email, name and password; creates an admin
- *   npm run add-user               asks for everything (including "admin? y/N")
- *   npm run add-user -- --email friend@example.com --name "Friend" --password "secret123"
- *   (PowerShell drops a bare "--": use npm run add-user '--' --email ... or node scripts/add-user.js ...)
- *
- * Without --password you are asked for one. An admin created here also takes over the
- * Gmail login of the old single-user version (.browser-profile), if there is one,
- * so you don't have to connect Gmail again.
- * ---------------------------------------------------------------------------
- */
+
 
 const path = require('path');
 process.chdir(path.join(__dirname, '..')); // same relative paths (.env, ./data) as the server
