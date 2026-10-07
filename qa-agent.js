@@ -14,68 +14,13 @@
  * ---------------------------------------------------------------------------
  */
 
-require('dotenv').config();
-
-const OpenAI = require('openai');
 const { z } = require('zod');
-const { Agent, run, tool, setDefaultOpenAIClient, setTracingDisabled } = require('@openai/agents');
+const { Agent, run, tool } = require('@openai/agents');
+const { useOpenAI, createBrowserTools, keepLatestPageOnly, sameSite, short, usageOf, openUrl } = require('./ai-browser');
 
 const QA = {
   model: process.env.QA_MODEL || process.env.OPENAI_MODEL || 'gpt-4.1-mini',
-  snapshotChars: 24000, // ~6k tokens: what the model reads per page
 };
-
-let clientReady = false;
-function useOpenAI() {
-  if (!process.env.OPENAI_API_KEY) return false;
-  if (!clientReady) {
-    setDefaultOpenAIClient(new OpenAI({ apiKey: process.env.OPENAI_API_KEY, baseURL: process.env.OPENAI_BASE_URL || undefined }));
-    setTracingDisabled(!/^(1|true|yes|on)$/i.test(process.env.QA_TRACING || ''));
-    clientReady = true;
-  }
-  return true;
-}
-
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-/**
- * Before each AI request: older read_page results are replaced by a one-line note, so only
- * the newest page outline is sent. Without this every step re-sends every page read so far
- * and the cost grows with each step (measured: 600k input tokens for 20 steps).
- */
-function keepLatestPageOnly({ modelData }) {
-  const input = modelData.input.slice();
-  let newest = -1;
-  input.forEach((item, i) => {
-    if (item && item.type === 'function_call_result' && item.name === 'read_page') newest = i;
-  });
-  input.forEach((item, i) => {
-    if (item && item.type === 'function_call_result' && item.name === 'read_page' && i !== newest) {
-      const note = '(older page reading removed to save space; call read_page to see the page now)';
-      input[i] = { ...item, output: typeof item.output === 'string' ? note : { type: 'text', text: note } };
-    }
-  });
-  return { ...modelData, input };
-}
-const short = (s, n) => (String(s || '').length > n ? `${String(s).slice(0, n - 1)}…` : String(s || ''));
-
-/** "shop.example.com" and "www.example.com" count as the same site as "example.com". */
-function sameSite(url, baseHost) {
-  try {
-    const h = new URL(url).hostname.replace(/^www\./, '');
-    const base = baseHost.replace(/^www\./, '');
-    return h === base || h.endsWith(`.${base}`) || base.endsWith(`.${h}`);
-  } catch {
-    return false;
-  }
-}
-
-/** Waits for the page to settle after an action (navigation or script updates). */
-async function settle(page) {
-  await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
-  await page.waitForLoadState('load', { timeout: 3000 }).catch(() => {});
-  await sleep(600);
-}
 
 const INSTRUCTIONS = (site, userInstructions, maxSteps) => `You are a careful QA tester testing the website ${site} in a real browser.
 Use the tools to look at pages and act on them. Every tool call is one step; you have at most ${maxSteps} steps, so plan.
@@ -151,9 +96,10 @@ async function runQaAgent(page, task, log, helpers) {
 
   log.action(`Opening ${startUrl}${task.mobile ? ' (phone size)' : ''}`);
   const t0 = Date.now();
-  const response = await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  const { response, slow } = await openUrl(page, startUrl);
   await page.waitForLoadState('load', { timeout: 15000 }).catch(() => {});
   const loadMs = Date.now() - t0;
+  if (slow) log.warn('The start page is very slow to load; testing what is shown');
   const startStatus = response ? response.status() : 0;
   log.info(`Start page answered ${startStatus} in ${(loadMs / 1000).toFixed(1)} s`);
 
@@ -184,178 +130,14 @@ async function runQaAgent(page, task, log, helpers) {
 
   // ---- AI-driven testing ----------------------------------------------------------------------
   const tests = [];
-  let steps = 0;
-  const step = (label) => {
-    steps++;
-    log.action(label);
-  };
-  const LIMIT = 'STEP LIMIT REACHED: do not call more browser tools. Record any remaining results, then write the summary now.';
-  const outOfSteps = () => steps >= task.maxSteps;
-  /** After an action: back to the site if a click left it; what the model sees changed. */
-  const after = async () => {
-    await settle(page);
-    if (!sameSite(page.url(), baseHost)) {
-      const left = page.url();
-      await page.goBack({ timeout: 10000 }).catch(() => page.goto(startUrl).catch(() => {}));
-      await settle(page);
-      return `That opened another website (${short(left, 120)}), so the browser went back. Now on ${page.url()}.`;
-    }
-    return `Now on ${page.url()} — "${short(await page.title(), 120)}".`;
-  };
-  /** An element by its accessible role and name, as read_page lists them. */
-  const element = (role, name, index) => {
-    const loc = role === 'text' ? page.getByText(name, { exact: false }) : page.getByRole(role, { name, exact: false });
-    return loc.nth(index || 0);
-  };
-  const fail = (err) => `Failed: ${short(String(err && err.message ? err.message : err).split('\n')[0], 200)}`;
-
-  // One browser, one action at a time: if the model asks for two actions at once (e.g. typing
-  // two todos), they run one after the other instead of typing into the same box together.
-  let queue = Promise.resolve();
-  const oneAtATime = (fn) => (args) => {
-    const next = queue.then(() => fn(args));
-    queue = next.catch(() => {});
-    return next;
-  };
-
+  const browser = createBrowserTools(page, { startUrl, maxSteps: task.maxSteps, log, normalizeSiteUrl });
   const tools = [
-    tool({
-      name: 'read_page',
-      description: 'Read the current page: its address, title and an outline of its content and controls (role "name" per line).',
-      parameters: z.object({}),
-      execute: oneAtATime(async () => {
-        if (outOfSteps()) return LIMIT;
-        step('Reading the page');
-        const snapshot = await page.locator('body').ariaSnapshot({ timeout: 15000 }).catch((e) => `(could not read the page: ${e.message})`);
-        return `URL: ${page.url()}\nTitle: ${await page.title()}\n\n${short(snapshot, QA.snapshotChars)}`;
-      }),
-    }),
-    tool({
-      name: 'open_page',
-      description: `Open an address on ${baseHost} (a full URL or a path like /contact).`,
-      parameters: z.object({ address: z.string() }),
-      execute: oneAtATime(async ({ address }) => {
-        if (outOfSteps()) return LIMIT;
-        let url;
-        try {
-          url = new URL(address, page.url()).toString();
-        } catch {
-          return 'Not a valid address.';
-        }
-        if (!sameSite(url, baseHost) || !normalizeSiteUrl(url)) return `Not allowed: only pages on ${baseHost} can be opened.`;
-        step(`Opening ${short(url, 100)}`);
-        try {
-          const r = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
-          return `${r ? `Answered ${r.status()}. ` : ''}${await after()}`;
-        } catch (err) {
-          return fail(err);
-        }
-      }),
-    }),
-    tool({
-      name: 'click',
-      description: 'Click an element. role is its role from read_page (button, link, checkbox, tab, menuitem, option...) or "text" to click visible text. index picks among several matches (0 = first).',
-      parameters: z.object({ role: z.string(), name: z.string(), index: z.number().int().nullable() }),
-      execute: oneAtATime(async ({ role, name, index }) => {
-        if (outOfSteps()) return LIMIT;
-        step(`Clicking ${role} "${short(name, 60)}"`);
-        try {
-          await element(role, name, index).click({ timeout: 8000 });
-          return `Clicked. ${await after()}`;
-        } catch (err) {
-          return fail(err);
-        }
-      }),
-    }),
-    tool({
-      name: 'type_text',
-      description: 'Type into a field found by role (textbox, searchbox, combobox, spinbutton) and name. submit=true presses Enter afterwards.',
-      parameters: z.object({ role: z.string(), name: z.string(), text: z.string(), submit: z.boolean(), index: z.number().int().nullable() }),
-      execute: oneAtATime(async ({ role, name, text, submit, index }) => {
-        if (outOfSteps()) return LIMIT;
-        step(`Typing "${short(text, 40)}" into ${role} "${short(name, 50)}"${submit ? ' and pressing Enter' : ''}`);
-        try {
-          const field = element(role, name, index);
-          await field.fill(text, { timeout: 8000 });
-          if (submit) await field.press('Enter');
-          return `Typed. ${await after()}`;
-        } catch (err) {
-          return fail(err);
-        }
-      }),
-    }),
-    tool({
-      name: 'choose_option',
-      description: 'Pick an option in a drop-down (role combobox or listbox) by its label.',
-      parameters: z.object({ name: z.string(), option: z.string() }),
-      execute: oneAtATime(async ({ name, option }) => {
-        if (outOfSteps()) return LIMIT;
-        step(`Choosing "${short(option, 40)}" in "${short(name, 50)}"`);
-        try {
-          await page.getByRole('combobox', { name, exact: false }).first().selectOption({ label: option }, { timeout: 8000 });
-          return `Chosen. ${await after()}`;
-        } catch (err) {
-          return fail(err);
-        }
-      }),
-    }),
-    tool({
-      name: 'press_key',
-      description: 'Press a key on the page (Enter, Escape, Tab, ArrowDown...).',
-      parameters: z.object({ key: z.string() }),
-      execute: oneAtATime(async ({ key }) => {
-        if (outOfSteps()) return LIMIT;
-        step(`Pressing ${key}`);
-        try {
-          await page.keyboard.press(key);
-          return `Pressed. ${await after()}`;
-        } catch (err) {
-          return fail(err);
-        }
-      }),
-    }),
-    tool({
-      name: 'scroll',
-      description: 'Scroll the page down or up by one screen.',
-      parameters: z.object({ direction: z.enum(['down', 'up']) }),
-      execute: oneAtATime(async ({ direction }) => {
-        if (outOfSteps()) return LIMIT;
-        step(`Scrolling ${direction}`);
-        await page.mouse.wheel(0, direction === 'down' ? 700 : -700);
-        await sleep(500);
-        return 'Scrolled.';
-      }),
-    }),
-    tool({
-      name: 'check_text',
-      description: 'Check exactly what the page shows: how many visible elements contain this text, and their full texts (first 8). Use it to confirm a pass or fail.',
-      parameters: z.object({ text: z.string() }),
-      execute: oneAtATime(async ({ text }) => {
-        if (outOfSteps()) return LIMIT;
-        step(`Checking for "${short(text, 50)}"`);
-        const found = await page.evaluate((needle) => {
-          const lower = needle.toLowerCase();
-          const out = [];
-          // the smallest visible elements whose own text contains the needle
-          for (const el of document.querySelectorAll('body *')) {
-            if (!(el instanceof HTMLElement) || !el.offsetParent && getComputedStyle(el).position !== 'fixed') continue;
-            const t = (el.innerText || '').trim();
-            if (!t.toLowerCase().includes(lower)) continue;
-            if ([...el.children].some((c) => (c.innerText || '').toLowerCase().includes(lower))) continue;
-            out.push(t.replace(/\s+/g, ' ').slice(0, 160));
-          }
-          return out;
-        }, text).catch(() => []);
-        return found.length
-          ? `Visible ${found.length} time(s): ${found.slice(0, 8).map((t) => JSON.stringify(t)).join(', ')}`
-          : `"${text}" is not visible on the page.`;
-      }),
-    }),
+    ...browser.tools.filter((t) => t.name !== 'read_tables'),
     tool({
       name: 'record_result',
       description: 'Record the result of one check.',
       parameters: z.object({ test: z.string(), status: z.enum(['pass', 'fail', 'warning']), details: z.string() }),
-      execute: oneAtATime(async ({ test, status, details }) => {
+      execute: browser.oneAtATime(async ({ test, status, details }) => {
         const result = { test: short(test, 160), status, details: short(details, 600), page: page.url() };
         tests.push(result);
         const line = `${status === 'pass' ? 'PASS' : status === 'fail' ? 'FAIL' : 'WARNING'}: ${result.test}`;
@@ -391,6 +173,7 @@ async function runQaAgent(page, task, log, helpers) {
 
   const counts = { pass: 0, fail: 0, warning: 0 };
   tests.forEach((t) => counts[t.status]++);
+  const steps = browser.steps();
   log.success(`Testing done: ${counts.pass} passed, ${counts.fail} failed, ${counts.warning} warning(s) in ${steps} steps`);
   if (!summary) {
     const fails = tests.filter((t) => t.status === 'fail').map((t) => t.test);
@@ -416,9 +199,7 @@ async function runQaAgent(page, task, log, helpers) {
       failedRequests: failedRequests.slice(0, 20),
       mobileOverflow,
     },
-    usage: usage
-      ? { model: QA.model, requests: usage.requests, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens }
-      : { model: QA.model },
+    usage: usageOf(usage, QA.model),
   };
 }
 

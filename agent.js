@@ -655,6 +655,28 @@ function validateTask(input) {
       }
       return { type: 'qa_test', url, instructions, maxSteps, mobile: input.mobile === true };
     }
+    case 'web_task': {
+      const raw = str(input.url, 'url', 1000);
+      if (!raw) fail('Add the website address.');
+      const url = normalizeSiteUrl(raw);
+      if (!url) fail(`"${raw.slice(0, 80)}" is not a public website address.`);
+      const instructions = str(input.instructions, 'instructions', 3000);
+      if (!instructions) fail('Write what the agent should do on the website.');
+      let maxSteps = 30;
+      if (input.maxSteps !== undefined && input.maxSteps !== null && input.maxSteps !== '') {
+        maxSteps = Number(input.maxSteps);
+        if (!Number.isInteger(maxSteps) || maxSteps < 5 || maxSteps > QA_MAX_STEPS) fail(`"maxSteps" must be a whole number from 5 to ${QA_MAX_STEPS}.`);
+      }
+      // Login details: from the form (username / password) or carried over from an earlier check.
+      const given = input.secrets || {};
+      const username = typeof input.username === 'string' ? input.username : given.USERNAME || '';
+      const password = typeof input.password === 'string' ? input.password : given.PASSWORD || '';
+      if (username.length > 300 || password.length > 300) fail('The login details are too long.');
+      const task = { type: 'web_task', url, instructions, maxSteps, allowOtherSites: input.allowOtherSites === true, hasLogin: Boolean(username || password) };
+      // Not enumerable: JSON (the saved task, run history, API answers, schedules) never contains them.
+      Object.defineProperty(task, 'secrets', { value: { USERNAME: username, PASSWORD: password }, enumerable: false });
+      return task;
+    }
     default:
       return fail(`Unknown task type "${input.type}".`);
   }
@@ -2345,6 +2367,8 @@ const TASK_HANDLERS = {
   price_check: priceCheck,
   // AI-driven website tester (qa-agent.js, OpenAI Agents SDK); loaded only when used.
   qa_test: (page, task, log) => require('./qa-agent').runQaAgent(page, task, log, { normalizeSiteUrl, blockPrivateHosts, AgentError }),
+  // AI agent for any task on a website (web-agent.js); loaded only when used.
+  web_task: (page, task, log) => require('./web-agent').runWebAgent(page, task, log, { normalizeSiteUrl, blockPrivateHosts, AgentError }),
 };
 
 /** Tasks that work inside the user's Gmail (they need "Connect Gmail" first). */
@@ -2405,7 +2429,7 @@ async function runBrowserAgent(input, { userId, onLog, dryRun = false, postProce
         throw new AgentError('LOGIN_REQUIRED', 'Gmail is not connected yet. Click "Connect Gmail" on the dashboard, sign in once, then retry.');
       }
       const context = await getContext(s, log);
-      page = await openPage(context, { regularUserAgent: !['amazon_research', 'price_check', 'qa_test'].includes(task.type) });
+      page = await openPage(context, { regularUserAgent: !['amazon_research', 'price_check', 'qa_test', 'web_task'].includes(task.type) });
       stopScreencast = await startScreencast(page, log, s);
       if (needsGmail(task)) {
         await openGmail(page, log);
