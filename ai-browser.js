@@ -17,6 +17,7 @@ const { z } = require('zod');
 const { tool, run, setDefaultOpenAIClient, setTracingDisabled } = require('@openai/agents');
 
 const SNAPSHOT_CHARS = 24000; // ~6k tokens: what the model reads per page
+const QUIET_MAX_MS = 25000; // after an action, wait this long at most for the site's background requests
 // One AI request may take this long before it is retried (the OpenAI default is 10 minutes,
 // so a stuck request left the task "running" with nothing happening).
 const AI_REQUEST_TIMEOUT_MS = Math.max(15, Number(process.env.AI_REQUEST_TIMEOUT_SECONDS) || 60) * 1000;
@@ -195,7 +196,45 @@ function createBrowserTools(page, opts) {
   const outOfSteps = () => steps >= maxSteps;
   const allowed = (url) => Boolean(normalizeSiteUrl(url)) && (allowOtherSites || sameSite(url, baseHost));
 
-  /** After an action: back to the site if a click left it (unless other sites are allowed). */
+  // The site's background requests (XHR / fetch) still waiting for an answer. Many sites load
+  // search results this way, some slowly (measured: 13 s), and show "0 results" until then.
+  const pending = new Map();
+  const track = (r) => {
+    if (['xhr', 'fetch'].includes(r.resourceType())) pending.set(r, Date.now());
+  };
+  const untrack = (r) => pending.delete(r);
+  page.on('request', track);
+  page.on('requestfinished', untrack);
+  page.on('requestfailed', untrack);
+
+  /** Waits (up to maxMs) until the site has no background request open for a moment. false if it is still busy. */
+  const waitForQuiet = async (maxMs = QUIET_MAX_MS) => {
+    const until = Date.now() + maxMs;
+    let quietSince = 0;
+    while (Date.now() < until) {
+      // a request open for over a minute is a long poll, not the page loading
+      const open = [...pending.values()].filter((t) => Date.now() - t < 60000).length;
+      if (open) quietSince = 0;
+      else if (!quietSince) quietSince = Date.now();
+      else if (Date.now() - quietSince >= 700) return true;
+      await sleep(200);
+    }
+    return false;
+  };
+
+  /** "Loading…", "Getting location…", "Please wait" still on the page: a note for the model, or ''. */
+  const loadingNote = async () => {
+    const seen = await page
+      .evaluate(() => {
+        const re = /\b(loading|getting|fetching|searching|please wait|processing)\b[^\n]{0,40}?(\.\.\.|…)|\bplease wait\b/i;
+        const m = (document.body.innerText || '').match(re);
+        return m ? m[0] : '';
+      })
+      .catch(() => '');
+    return seen ? ` The page still shows "${short(seen, 60)}": it may still be loading results; use wait, then read_page again before you decide.` : '';
+  };
+
+  /** After an action: wait for the site to finish loading; back to the site if a click left it (unless other sites are allowed). */
   const after = async () => {
     await settle(page);
     if (!allowOtherSites && !sameSite(page.url(), baseHost)) {
@@ -204,7 +243,8 @@ function createBrowserTools(page, opts) {
       await settle(page);
       return `That opened another website (${short(left, 120)}), so the browser went back. Now on ${page.url()}.`;
     }
-    return `Now on ${page.url()} — "${short(await page.title(), 120)}".`;
+    const quiet = await waitForQuiet();
+    return `Now on ${page.url()} — "${short(await page.title(), 120)}".${quiet ? '' : ' The site is still loading something.'}${await loadingNote()}`;
   };
   /** An element by its accessible role and name, as read_page lists them. */
   const element = (role, name, index) => {
@@ -244,7 +284,8 @@ function createBrowserTools(page, opts) {
         if (outOfSteps()) return LIMIT;
         step('Reading the page');
         const snapshot = await page.locator('body').ariaSnapshot({ timeout: 15000 }).catch((e) => `(could not read the page: ${e.message})`);
-        return `URL: ${page.url()}\nTitle: ${await page.title()}\n\n${short(snapshot, SNAPSHOT_CHARS)}`;
+        const note = await loadingNote();
+        return `URL: ${page.url()}\nTitle: ${await page.title()}${note ? `\nNote:${note}` : ''}\n\n${short(snapshot, SNAPSHOT_CHARS)}`;
       }),
     }),
     tool({
@@ -368,6 +409,30 @@ function createBrowserTools(page, opts) {
         } catch (err) {
           return fail(err);
         }
+      }),
+    }),
+    tool({
+      name: 'wait',
+      description: 'Wait for the page to finish loading (e.g. search results that show "Loading…" or "0 results" at first). text (optional) = a text that will show once it has loaded, or a loading text to wait to go away; seconds = the longest to wait, up to 30.',
+      parameters: z.object({ text: z.string().nullable(), seconds: z.number().nullable() }),
+      execute: oneAtATime(async ({ text, seconds }) => {
+        if (outOfSteps()) return LIMIT;
+        const ms = Math.min(30, Math.max(2, Number(seconds) || 15)) * 1000;
+        step(text ? `Waiting for "${short(text, 50)}"` : `Waiting up to ${ms / 1000}s for the page`);
+        const started = Date.now();
+        if (text && /loading|getting|fetching|searching|please wait|processing/i.test(text)) {
+          // a loading text: wait for it to go away
+          const gone = await page.getByText(text, { exact: false }).first().waitFor({ state: 'hidden', timeout: ms }).then(() => true, () => false);
+          if (!gone) return `"${text}" is still shown after ${ms / 1000}s.`;
+          await waitForQuiet(5000);
+        } else if (text) {
+          const shown = await page.getByText(text, { exact: false }).first().waitFor({ state: 'visible', timeout: ms }).then(() => true, () => false);
+          if (!shown) return `"${text}" did not appear in ${ms / 1000}s.${await loadingNote()}`;
+        } else {
+          await sleep(2000);
+          await waitForQuiet(ms - 2000);
+        }
+        return `Waited ${Math.round((Date.now() - started) / 1000)}s.${await loadingNote() || ' The page has finished loading.'} Call read_page to see it.`;
       }),
     }),
     tool({
