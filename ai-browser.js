@@ -14,16 +14,21 @@ require('dotenv').config();
 
 const OpenAI = require('openai');
 const { z } = require('zod');
-const { tool, setDefaultOpenAIClient, setTracingDisabled } = require('@openai/agents');
+const { tool, run, setDefaultOpenAIClient, setTracingDisabled } = require('@openai/agents');
 
 const SNAPSHOT_CHARS = 24000; // ~6k tokens: what the model reads per page
+// One AI request may take this long before it is retried (the OpenAI default is 10 minutes,
+// so a stuck request left the task "running" with nothing happening).
+const AI_REQUEST_TIMEOUT_MS = Math.max(15, Number(process.env.AI_REQUEST_TIMEOUT_SECONDS) || 60) * 1000;
+// A whole AI task stops after this long and keeps what it has done so far.
+const AI_TASK_LIMIT_MS = Math.max(1, Number(process.env.AI_TASK_MAX_MINUTES) || 10) * 60 * 1000;
 
 let clientReady = false;
 /** Sets up the Agents SDK with our OpenAI key. false when there is no key. */
 function useOpenAI() {
   if (!process.env.OPENAI_API_KEY) return false;
   if (!clientReady) {
-    setDefaultOpenAIClient(new OpenAI({ apiKey: process.env.OPENAI_API_KEY, baseURL: process.env.OPENAI_BASE_URL || undefined }));
+    setDefaultOpenAIClient(new OpenAI({ apiKey: process.env.OPENAI_API_KEY, baseURL: process.env.OPENAI_BASE_URL || undefined, timeout: AI_REQUEST_TIMEOUT_MS, maxRetries: 2 }));
     setTracingDisabled(!/^(1|true|yes|on)$/i.test(process.env.QA_TRACING || ''));
     clientReady = true;
   }
@@ -93,6 +98,83 @@ function usageOf(usage, model) {
     : { model };
 }
 
+/** A field that opens suggestions while you type (location, city, address search...). */
+async function looksLikeAutocomplete(field) {
+  return field
+    .evaluate((el) => {
+      const attrs = ['aria-autocomplete', 'list', 'aria-haspopup', 'aria-controls', 'aria-owns'].some((a) => el.hasAttribute(a));
+      const words = [el.id, el.name, el.className, el.placeholder, el.getAttribute('aria-label'), el.getAttribute('autocomplete')].join(' ');
+      return attrs || /locat|city|address|place|autocomplete|suggest|where/i.test(words);
+    }, null, { timeout: 3000 })
+    .catch(() => false);
+}
+
+/** Types like a person (key events), so autocomplete lists open. */
+async function typeKeyByKey(field, value) {
+  await field.click({ timeout: 8000 });
+  await field.fill('', { timeout: 5000 }).catch(() => {});
+  await field.pressSequentially(value, { delay: 70, timeout: 20000 });
+  await sleep(1500); // time for the suggestions to load
+}
+
+// The items of an autocomplete list on common sites (ARIA, Google Places, jQuery UI, others).
+const SUGGESTIONS = '[role="option"], [role="listbox"] li, .pac-item, .ui-menu-item, .autocomplete-suggestion, [class*="suggestion"] li, [class*="autocomplete"] li, [class*="dropdown"] li';
+
+/** The visible suggestions of an open autocomplete list (first 8). */
+async function readSuggestions(page) {
+  return page
+    .evaluate((sel) => {
+      const out = [];
+      for (const el of document.querySelectorAll(sel)) {
+        const r = el.getBoundingClientRect();
+        const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+        if (r.width && r.height && t && !out.includes(t)) out.push(t.slice(0, 100));
+        if (out.length >= 8) break;
+      }
+      return out;
+    }, SUGGESTIONS)
+    .catch(() => []);
+}
+
+/**
+ * Runs an Agents SDK agent with a time limit, and while the model is thinking (no tool
+ * running for a while) writes "AI is thinking…" to the log so the task doesn't look stuck.
+ * Returns { result, usage, stopped }: stopped is null, 'steps', 'time' or the error message.
+ */
+async function runAgent(agent, input, { maxTurns, log, browser, label = 'The AI agent' }) {
+  const abort = new AbortController();
+  const timer = setTimeout(() => abort.abort(), AI_TASK_LIMIT_MS);
+  let lastNote = 0;
+  const heartbeat = setInterval(() => {
+    const idle = browser.idleMs();
+    if (idle >= 15000 && Date.now() - lastNote >= 15000) {
+      lastNote = Date.now();
+      log.info(`AI is thinking… (${Math.round(idle / 1000)}s)`);
+    }
+  }, 5000);
+  try {
+    const result = await run(agent, input, { maxTurns, callModelInputFilter: keepLatestPageOnly, signal: abort.signal });
+    return { result, usage: result.runContext && result.runContext.usage, stopped: null };
+  } catch (err) {
+    const usage = err && err.state && err.state.usage ? err.state.usage : null;
+    let stopped;
+    if (abort.signal.aborted) {
+      stopped = 'time';
+      log.warn(`${label} reached the time limit (${Math.round(AI_TASK_LIMIT_MS / 60000)} min) and stopped`);
+    } else if (/max turns/i.test(err && err.message)) {
+      stopped = 'steps';
+      log.warn(`${label} used all its steps`);
+    } else {
+      stopped = short(err && err.message, 200);
+      log.warn(`${label} stopped: ${stopped}`);
+    }
+    return { result: null, usage, stopped };
+  } finally {
+    clearTimeout(timer);
+    clearInterval(heartbeat);
+  }
+}
+
 /**
  * The browser tools for an agent working on `page`.
  * opts: { startUrl, allowOtherSites, maxSteps, log, normalizeSiteUrl, secrets: { USERNAME, PASSWORD } | null }
@@ -103,6 +185,8 @@ function createBrowserTools(page, opts) {
   const secrets = opts.secrets || {};
   const baseHost = new URL(startUrl).hostname;
   let steps = 0;
+  let lastActivity = Date.now();
+  let busy = false;
   const step = (label) => {
     steps++;
     log.action(label);
@@ -133,7 +217,15 @@ function createBrowserTools(page, opts) {
   // two todos), they run one after the other instead of typing into the same box together.
   let queue = Promise.resolve();
   const oneAtATime = (fn) => (args) => {
-    const next = queue.then(() => fn(args));
+    const next = queue.then(async () => {
+      busy = true;
+      try {
+        return await fn(args);
+      } finally {
+        busy = false;
+        lastActivity = Date.now();
+      }
+    });
     queue = next.catch(() => {});
     return next;
   };
@@ -194,19 +286,57 @@ function createBrowserTools(page, opts) {
     }),
     tool({
       name: 'type_text',
-      description: 'Type into a field found by role (textbox, searchbox, combobox, spinbutton) and name. For login details write {{USERNAME}} or {{PASSWORD}} exactly; the real values are filled in for you. submit=true presses Enter afterwards.',
+      description: 'Type into a field found by role (textbox, searchbox, combobox, spinbutton) and name. For login details write {{USERNAME}} or {{PASSWORD}} exactly; the real values are filled in for you. submit=true presses Enter afterwards. Location, city, address and other autocomplete fields are typed key by key and the reply lists the suggestions that open: pick one with pick_suggestion.',
       parameters: z.object({ role: z.string(), name: z.string(), text: z.string(), submit: z.boolean(), index: z.number().int().nullable() }),
       execute: oneAtATime(async ({ role, name, text, submit, index }) => {
         if (outOfSteps()) return LIMIT;
+        const secret = usesSecret(text);
         // the log shows the placeholder, never the real value
-        step(`Typing ${usesSecret(text) ? text : `"${short(text, 40)}"`} into ${role} "${short(name, 50)}"${submit ? ' and pressing Enter' : ''}`);
+        step(`Typing ${secret ? text : `"${short(text, 40)}"`} into ${role} "${short(name, 50)}"${submit ? ' and pressing Enter' : ''}`);
         try {
           const field = element(role, name, index);
-          await field.fill(withSecrets(text), { timeout: 8000 });
-          if (submit) await field.press('Enter');
-          return `Typed. ${await after()}`;
+          const value = withSecrets(text);
+          const keyByKey = !secret && (/combobox|searchbox/i.test(role) || (await looksLikeAutocomplete(field)));
+          if (keyByKey) {
+            await typeKeyByKey(field, value);
+          } else {
+            await field.fill(value, { timeout: 8000 });
+            // some fields ignore fill(): type it like a person instead
+            if ((await field.inputValue({ timeout: 2000 }).catch(() => value)) !== value) await typeKeyByKey(field, value);
+          }
+          const filled = (await field.inputValue({ timeout: 2000 }).catch(() => null)) === value;
+          if (secret) log.info(`${filled ? 'Filled' : 'Could not fill'} the ${/PASSWORD/.test(text) ? 'password' : 'username'} field`);
+          if (submit) {
+            await field.press('Enter');
+            return `Typed. ${await after()}`;
+          }
+          const suggestions = keyByKey ? await readSuggestions(page) : [];
+          if (suggestions.length) {
+            log.info(`${suggestions.length} suggestion(s) appeared`);
+            return `Typed. Suggestions opened: ${suggestions.map((t) => JSON.stringify(t)).join(', ')}. Pick the right one with pick_suggestion so the site accepts the value.`;
+          }
+          return `Typed${filled ? '' : ' (but the field does not show the text: try another field or way)'}. ${await after()}`;
         } catch (err) {
           return fail(err);
+        }
+      }),
+    }),
+    tool({
+      name: 'pick_suggestion',
+      description: 'Click a suggestion in the list that opened under a field after type_text (city, address, search suggestions). text = the suggestion as type_text listed it, or part of it.',
+      parameters: z.object({ text: z.string() }),
+      execute: oneAtATime(async ({ text }) => {
+        if (outOfSteps()) return LIMIT;
+        step(`Picking the suggestion "${short(text, 60)}"`);
+        try {
+          const items = page.locator(SUGGESTIONS).filter({ visible: true });
+          const exact = items.filter({ hasText: new RegExp(`^\\s*${text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i') });
+          const item = (await exact.count()) ? exact.first() : items.filter({ hasText: text }).first();
+          await item.click({ timeout: 8000 });
+          return `Picked. ${await after()}`;
+        } catch (err) {
+          const open = await readSuggestions(page);
+          return `${fail(err)}${open.length ? ` Suggestions now: ${open.map((t) => JSON.stringify(t)).join(', ')}` : ' No suggestion list is open: type into the field again.'}`;
         }
       }),
     }),
@@ -303,7 +433,8 @@ function createBrowserTools(page, opts) {
     }),
   ];
 
-  return { tools, oneAtATime, steps: () => steps, outOfSteps, LIMIT };
+  const idleMs = () => (busy ? 0 : Date.now() - lastActivity);
+  return { tools, oneAtATime, steps: () => steps, outOfSteps, idleMs, LIMIT };
 }
 
-module.exports = { useOpenAI, createBrowserTools, keepLatestPageOnly, sameSite, settle, short, sleep, usageOf, openUrl };
+module.exports = { useOpenAI, runAgent, createBrowserTools, keepLatestPageOnly, sameSite, settle, short, sleep, usageOf, openUrl };

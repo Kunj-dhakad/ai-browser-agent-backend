@@ -17,8 +17,8 @@
  */
 
 const { z } = require('zod');
-const { Agent, run, tool } = require('@openai/agents');
-const { useOpenAI, createBrowserTools, keepLatestPageOnly, short, usageOf, openUrl } = require('./ai-browser');
+const { Agent, tool } = require('@openai/agents');
+const { useOpenAI, runAgent, createBrowserTools, short, usageOf, openUrl } = require('./ai-browser');
 
 const WEB = {
   model: process.env.WEB_AGENT_MODEL || process.env.QA_MODEL || process.env.OPENAI_MODEL || 'gpt-4.1-mini',
@@ -36,9 +36,15 @@ How to work:
 - The start page is already open: start with read_page. Find elements by their role and name exactly as read_page lists them (e.g. button "Sign in", link "Orders", textbox "Search").
 - After an action, call read_page again when you need to see the result.
 - ${hasLogin ? 'If you need to log in, type {{USERNAME}} into the username / email field and {{PASSWORD}} into the password field, exactly like that. The real values are filled in for you; you never see them and must never ask for them.' : 'No login details were given. If the task needs a login, stop and say so in your answer.'}
-- When the page has a table, use read_tables to read it exactly. Save the data the user asked for with save_data: one row per item, short clear column names, the values exactly as the page shows them. Never invent or guess values; leave a cell empty if the page doesn't show it.
+- When the page has a table, use read_tables to read it exactly. Save the data the user asked for with save_data: one row per item, short clear column names, the values exactly as the page shows them. Never invent or guess values; leave a cell empty if the page doesn't show it. Whenever the task asks for data, a list, values or details, save them with save_data before you answer, even if it is a single value.
 - Use check_text to confirm a value before you report it.
+- Search, location, city and address boxes often open a suggestion list while you type. type_text lists the suggestions: choose the matching one with pick_suggestion, otherwise the site may say the field is empty. If a box wants a city and the task names a country or region, use real cities in it (e.g. for "USA": New York, Los Angeles, Chicago, Houston, Phoenix...).
+- For a task over several items (e.g. 10 cities, 5 products), do them one by one: search one, save its data with save_data, then the next. Keep going until all are done or steps run low.
 - When the task is done (or you are nearly out of steps), stop calling tools and answer in plain words: what you did, and the result (the main values, or a short summary of the data saved). If something stopped you, say exactly what.
+
+Decide for yourself:
+- You cannot ask the user anything during the task and nobody will answer. Never end with a question or "let me know". When something is unclear, pick the most sensible reading of the task and do it.
+- When a way doesn't work, try another before giving up: a different field or button, the suggestion list, a menu, a simpler search term, another page of the site.
 
 Rules:
 - ${allowOtherSites ? 'You may follow the site to other websites when the task needs it (for example a sign-in page).' : `Stay on ${site}.`}
@@ -121,24 +127,17 @@ async function runWebAgent(page, task, log, helpers) {
   });
 
   log.action(`AI agent (${WEB.model}) is working on the task, up to ${task.maxSteps} steps`);
-  let answer = '';
-  let usage = null;
-  let stoppedEarly = false;
-  try {
-    const result = await run(agent, 'Do the task now.', { maxTurns: task.maxSteps * 2 + 10, callModelInputFilter: keepLatestPageOnly });
-    answer = scrub(String(result.finalOutput || '').trim());
-    usage = result.runContext && result.runContext.usage;
-  } catch (err) {
-    usage = err && err.state && err.state.usage ? err.state.usage : null;
-    stoppedEarly = true;
-    log.warn(/max turns/i.test(err && err.message) ? 'The AI agent used all its steps' : `The AI agent stopped: ${short(err && err.message, 200)}`);
-  }
+  const out = await runAgent(agent, 'Do the task now.', { maxTurns: task.maxSteps * 2 + 10, log, browser, label: 'The AI agent' });
+  const usage = out.usage;
+  const stoppedEarly = out.result ? null : out.stopped; // 'steps', 'time' or the error
+  let answer = out.result ? scrub(String(out.result.finalOutput || '').trim()) : '';
   const steps = browser.steps();
   if (!answer) {
     answer = data.rows.length
       ? `Collected ${data.rows.length} row(s) of data before stopping.`
       : 'The agent stopped before finishing the task; try again with more steps or clearer steps.';
-    if (stoppedEarly) answer += ' It ran out of steps.';
+    if (stoppedEarly === 'time') answer += ' It reached the time limit.';
+    else if (stoppedEarly === 'steps') answer += ' It ran out of steps.';
   }
   log.success(`Done in ${steps} steps${data.rows.length ? `: ${data.rows.length} row(s) of data` : ''}`);
 
@@ -147,7 +146,7 @@ async function runWebAgent(page, task, log, helpers) {
     answer,
     data,
     steps,
-    stoppedEarly,
+    stoppedEarly: Boolean(stoppedEarly),
     finalUrl: page.url(),
     usedLogin: hasLogin,
     usage: usageOf(usage, WEB.model),

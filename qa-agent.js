@@ -15,8 +15,8 @@
  */
 
 const { z } = require('zod');
-const { Agent, run, tool } = require('@openai/agents');
-const { useOpenAI, createBrowserTools, keepLatestPageOnly, sameSite, short, usageOf, openUrl } = require('./ai-browser');
+const { Agent, tool } = require('@openai/agents');
+const { useOpenAI, runAgent, createBrowserTools, sameSite, short, usageOf, openUrl } = require('./ai-browser');
 
 const QA = {
   model: process.env.QA_MODEL || process.env.OPENAI_MODEL || 'gpt-4.1-mini',
@@ -157,19 +157,11 @@ async function runQaAgent(page, task, log, helpers) {
   });
 
   log.action(`AI tester (${QA.model}) is testing the site, up to ${task.maxSteps} steps`);
-  let summary = '';
-  let usage = null;
-  let stoppedEarly = false;
-  try {
-    const result = await run(agent, `Test ${startUrl} now.`, { maxTurns: task.maxSteps * 2 + 10, callModelInputFilter: keepLatestPageOnly });
-    summary = String(result.finalOutput || '').trim();
-    usage = result.runContext && result.runContext.usage;
-  } catch (err) {
-    // Out of steps (or the model failed): keep everything recorded so far.
-    usage = err && err.state && err.state.usage ? err.state.usage : null;
-    stoppedEarly = true;
-    log.warn(/max turns/i.test(err && err.message) ? 'The AI tester used all its steps' : `The AI tester stopped: ${short(err && err.message, 200)}`);
-  }
+  // Out of steps, out of time or the model failed: keep everything recorded so far.
+  const out = await runAgent(agent, `Test ${startUrl} now.`, { maxTurns: task.maxSteps * 2 + 10, log, browser, label: 'The AI tester' });
+  const usage = out.usage;
+  const stoppedEarly = !out.result;
+  let summary = out.result ? String(out.result.finalOutput || '').trim() : '';
 
   const counts = { pass: 0, fail: 0, warning: 0 };
   tests.forEach((t) => counts[t.status]++);
