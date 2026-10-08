@@ -74,8 +74,8 @@ function addUsage(a, b) {
  * Runs the custom web agent on `page` (already in the user's browser) and returns
  * { url, answer, data: { columns, rows }, steps, stoppedEarly, finalUrl, usedLogin, usage }.
  * helpers: { normalizeSiteUrl, blockPrivateHosts, AgentError }
- * preset (research agents): { name, instructions, columns } — their own prompt, and the
- * table always has exactly these columns.
+ * preset (research agents): { name, instructions, columns, prepare? } — their own prompt, the
+ * table always has exactly these columns, and prepare(page, log) runs before the AI starts.
  */
 async function runWebAgent(page, task, log, helpers, preset = null) {
   const { normalizeSiteUrl, blockPrivateHosts, AgentError } = helpers;
@@ -91,6 +91,7 @@ async function runWebAgent(page, task, log, helpers, preset = null) {
   const { response, slow } = await openUrl(page, startUrl);
   if (slow) log.warn('The site is very slow to load; continuing with what is shown');
   log.info(`The site answered ${response ? response.status() : 'nothing'}${hasLogin ? '; login details are ready (hidden from the AI)' : ''}`);
+  if (preset && preset.prepare) await preset.prepare(page, log);
 
   // The data the model collects: one table, columns merged by name (case does not matter).
   const data = { columns: preset ? preset.columns.slice() : [], rows: [] };

@@ -205,6 +205,7 @@ function createBrowserTools(page, opts) {
 
   // The site's background requests (XHR / fetch) still waiting for an answer. Many sites load
   // search results this way, some slowly (measured: 13 s), and show "0 results" until then.
+  // Requests to other sites (ads, analytics) are left out: on news sites they never stop.
   const pending = new Map();
   const track = (r) => {
     if (['xhr', 'fetch'].includes(r.resourceType())) pending.set(r, Date.now());
@@ -220,7 +221,8 @@ function createBrowserTools(page, opts) {
     let quietSince = 0;
     while (Date.now() < until) {
       // a request open for over a minute is a long poll, not the page loading
-      const open = [...pending.values()].filter((t) => Date.now() - t < 60000).length;
+      const host = new URL(page.url()).hostname;
+      const open = [...pending].filter(([r, t]) => Date.now() - t < 60000 && sameSite(r.url(), host)).length;
       if (open) quietSince = 0;
       else if (!quietSince) quietSince = Date.now();
       else if (Date.now() - quietSince >= 700) return true;
