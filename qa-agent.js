@@ -161,7 +161,7 @@ async function runQaAgent(page, task, log, helpers) {
   const out = await runAgent(agent, `Test ${startUrl} now.`, { maxTurns: task.maxSteps * 2 + 10, log, browser, label: 'The AI tester' });
   const usage = out.usage;
   const stoppedEarly = !out.result;
-  let summary = out.result ? String(out.result.finalOutput || '').trim() : '';
+  let summary = out.result ? String(out.result.finalOutput || '').trim() : out.stopped === 'account' ? out.message : '';
 
   const counts = { pass: 0, fail: 0, warning: 0 };
   tests.forEach((t) => counts[t.status]++);

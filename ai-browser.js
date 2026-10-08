@@ -165,6 +165,13 @@ async function runAgent(agent, input, { maxTurns, log, browser, label = 'The AI 
     } else if (/max turns/i.test(err && err.message)) {
       stopped = 'steps';
       log.warn(`${label} used all its steps`);
+    } else if (/no credits|insufficient_quota|quota|billing|incorrect api key|invalid api key|401/i.test(err && err.message)) {
+      // the OpenAI account can't be used: nothing the agent can do about it
+      const message = /401|api key/i.test(err.message)
+        ? 'The OpenAI API key is not valid. Check OPENAI_API_KEY in backend/.env.'
+        : 'The OpenAI account has no credits left. Add credits at platform.openai.com (Settings → Billing), then run the task again.';
+      log.warn(message);
+      return { result: null, usage, stopped: 'account', message };
     } else {
       stopped = short(err && err.message, 200);
       log.warn(`${label} stopped: ${stopped}`);

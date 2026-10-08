@@ -49,6 +49,7 @@ const AMAZON_MAX_RESULTS = 30; // products per Amazon research task (one search 
 const AMAZON_MAX_DETAILS = 10; // of those, product pages opened for features and reviews (~5 s each)
 const PRICE_MAX_ITEMS = 20; // product links per price watch (~5 s each)
 const QA_MAX_STEPS = 60; // AI tester actions per website test (each one is an AI request)
+const RESEARCH_MAX_ITEMS = { travel_research: 10, job_search: 50, news_research: 20 }; // rows per research task
 
 
 function normalizeSiteUrl(raw) {
@@ -555,6 +556,22 @@ function validateTask(input) {
     if (!Number.isInteger(n) || n < 1 || n > 50) fail('"limit" must be a whole number from 1 to 50.');
     return n;
   };
+  /** How many rows a research task brings back. */
+  const countOf = (v, fallback, type) => {
+    if (v === undefined || v === null || v === '') return fallback;
+    const n = Number(v);
+    const max = RESEARCH_MAX_ITEMS[type];
+    if (!Number.isInteger(n) || n < 1 || n > max) fail(`"count" must be a whole number from 1 to ${max}.`);
+    return n;
+  };
+  /** "2026-11-12" or '' (a real calendar date). */
+  const dateOf = (v, name) => {
+    const d = str(v, name, 10);
+    if (!d) return '';
+    const t = Date.parse(`${d}T00:00:00Z`);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d) || !Number.isFinite(t) || new Date(t).toISOString().slice(0, 10) !== d) fail(`"${name}" must be a date like 2026-11-12.`);
+    return d;
+  };
 
   switch (input.type) {
     case 'send_email': {
@@ -676,6 +693,52 @@ function validateTask(input) {
       // Not enumerable: JSON (the saved task, run history, API answers, schedules) never contains them.
       Object.defineProperty(task, 'secrets', { value: { USERNAME: username, PASSWORD: password }, enumerable: false });
       return task;
+    }
+    case 'travel_research': {
+      const search = ['flights', 'hotels', 'both'].includes(input.search) ? input.search : 'both';
+      const from = str(input.from, 'from', 100);
+      const to = str(input.to, 'to', 100);
+      if (!to) fail('Write where you are going, e.g. "Dubai".');
+      if (search !== 'hotels' && !from) fail('Write where you fly from, e.g. "Delhi".');
+      const departDate = dateOf(input.departDate, 'departDate');
+      if (!departDate) fail(search === 'hotels' ? 'Pick the check-in date.' : 'Pick the travel date.');
+      const today = new Date(Date.now() - 86400000).toISOString().slice(0, 10); // a day of leeway for time zones
+      if (departDate < today) fail('The travel date is in the past.');
+      if (departDate > new Date(Date.now() + 330 * 86400000).toISOString().slice(0, 10)) fail('The travel date must be within the next 11 months.');
+      const returnDate = dateOf(input.returnDate, 'returnDate');
+      if (returnDate && returnDate <= departDate) fail('The return date must be after the travel date.');
+      if (returnDate && Date.parse(returnDate) - Date.parse(departDate) > 30 * 86400000) fail('Trips of at most 30 days.');
+      const adults = input.adults === undefined || input.adults === '' ? 1 : Number(input.adults);
+      if (!Number.isInteger(adults) || adults < 1 || adults > 9) fail('"adults" must be from 1 to 9.');
+      const currency = ['USD', 'INR', 'EUR', 'GBP', 'AED'].includes(input.currency) ? input.currency : 'USD';
+      return { type: 'travel_research', search, from, to, departDate, returnDate, adults, currency, count: countOf(input.count, 5, 'travel_research'), preferences: str(input.preferences, 'preferences', 500) };
+    }
+    case 'job_search': {
+      const role = str(input.role, 'role', 150);
+      if (!role) fail('Write the job you are looking for, e.g. "React developer".');
+      return {
+        type: 'job_search',
+        role,
+        location: str(input.location, 'location', 150),
+        remote: input.remote === true,
+        experience: ['entry', 'mid', 'senior'].includes(input.experience) ? input.experience : 'any',
+        posted: ['day', 'week', 'month'].includes(input.posted) ? input.posted : 'any',
+        count: countOf(input.count, 20, 'job_search'),
+        preferences: str(input.preferences, 'preferences', 500),
+      };
+    }
+    case 'news_research': {
+      const topic = str(input.topic, 'topic', 200);
+      if (!topic) fail('Write the news topic, e.g. "electric vehicles in India".');
+      return {
+        type: 'news_research',
+        topic,
+        period: ['day', 'week', 'month'].includes(input.period) ? input.period : 'any',
+        region: ['us', 'in', 'gb', 'au', 'ca'].includes(input.region) ? input.region : 'us',
+        count: countOf(input.count, 8, 'news_research'),
+        readArticles: input.readArticles !== false,
+        focus: str(input.focus, 'focus', 500),
+      };
     }
     default:
       return fail(`Unknown task type "${input.type}".`);
@@ -2367,6 +2430,10 @@ const TASK_HANDLERS = {
   price_check: priceCheck,
   // AI-driven website tester (qa-agent.js, OpenAI Agents SDK); loaded only when used.
   qa_test: (page, task, log) => require('./qa-agent').runQaAgent(page, task, log, { normalizeSiteUrl, blockPrivateHosts, AgentError }),
+  // AI research agents on Google Travel, LinkedIn Jobs and Bing News (research-agents.js).
+  travel_research: (page, task, log) => require('./research-agents').runResearch(page, task, log, { normalizeSiteUrl, blockPrivateHosts, AgentError }),
+  job_search: (page, task, log) => require('./research-agents').runResearch(page, task, log, { normalizeSiteUrl, blockPrivateHosts, AgentError }),
+  news_research: (page, task, log) => require('./research-agents').runResearch(page, task, log, { normalizeSiteUrl, blockPrivateHosts, AgentError }),
   // AI agent for any task on a website (web-agent.js); loaded only when used.
   web_task: (page, task, log) => require('./web-agent').runWebAgent(page, task, log, { normalizeSiteUrl, blockPrivateHosts, AgentError }),
 };
