@@ -192,6 +192,11 @@ function describeTask(task) {
   if (task.type === 'travel_research') return `Research ${task.search === 'both' ? 'flights and hotels' : task.search}${task.from ? ` from ${task.from}` : ''} to ${task.to} on ${task.departDate}`;
   if (task.type === 'job_search') return `Find ${task.count} "${task.role}" jobs${task.location ? ` in ${task.location}` : ''} on LinkedIn`;
   if (task.type === 'news_research') return `Research ${task.count} news articles: ${task.topic}`;
+  if (task.type === 'web_research') return `Research on the web: ${task.question}`;
+  if (task.type === 'competitor_research') return `Research ${task.count} competitors of: ${task.business}`;
+  if (task.type === 'data_collection') return `Collect data from ${task.url}`;
+  if (task.type === 'crm_task') return `CRM (${task.action}) at ${task.url}`;
+  if (task.type === 'email_followup') return `Follow up on sent emails with no reply after ${task.olderThanDays} days`;
   if (task.type === 'website_contacts') return `Find contact details on ${task.urls.length} website(s)`;
   if (task.type === 'maps_search') return `Find ${task.limit} businesses on Google Maps: ${task.query}${task.location ? ` in ${task.location}` : ''}`;
   return `Read the latest ${task.limit} inbox emails`;

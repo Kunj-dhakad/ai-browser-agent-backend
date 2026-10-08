@@ -50,6 +50,10 @@ const AMAZON_MAX_DETAILS = 10; // of those, product pages opened for features an
 const PRICE_MAX_ITEMS = 20; // product links per price watch (~5 s each)
 const QA_MAX_STEPS = 60; // AI tester actions per website test (each one is an AI request)
 const RESEARCH_MAX_ITEMS = { travel_research: 10, job_search: 50, news_research: 20 }; // rows per research task
+const COMPETITORS_MAX = 8; // competitor websites per task (~10-20 s each)
+const COLLECT_MAX_PAGES = 10; // list pages per data collection task (one AI request each)
+const CRM_MAX_RECORDS = 25; // records per CRM task (several AI steps each)
+const FOLLOWUP_MAX = 15; // follow-ups per task
 
 
 function normalizeSiteUrl(raw) {
@@ -564,6 +568,13 @@ function validateTask(input) {
     if (!Number.isInteger(n) || n < 1 || n > max) fail(`"count" must be a whole number from 1 to ${max}.`);
     return n;
   };
+  /** A whole number from min to max (fallback when not given). */
+  const intOf = (v, fallback, min, max, name) => {
+    if (v === undefined || v === null || v === '') return fallback;
+    const n = Number(v);
+    if (!Number.isInteger(n) || n < min || n > max) fail(`"${name}" must be a whole number from ${min} to ${max}.`);
+    return n;
+  };
   /** "2026-11-12" or '' (a real calendar date). */
   const dateOf = (v, name) => {
     const d = str(v, name, 10);
@@ -739,6 +750,72 @@ function validateTask(input) {
         readArticles: input.readArticles !== false,
         focus: str(input.focus, 'focus', 500),
       };
+    }
+    case 'web_research': {
+      const question = str(input.question, 'question', 500);
+      if (!question) fail('Write your question.');
+      return { type: 'web_research', question, count: intOf(input.count, 5, 3, 10, 'count'), detail: input.detail === 'detailed' ? 'detailed' : 'short', focus: str(input.focus, 'focus', 300) };
+    }
+    case 'competitor_research': {
+      const business = str(input.business, 'business', 300);
+      if (!business) fail('Describe your business, e.g. "online yoga classes in India".');
+      const rawSite = str(input.website, 'website', 500);
+      const website = rawSite ? normalizeSiteUrl(rawSite) : '';
+      if (rawSite && !website) fail(`"${rawSite.slice(0, 80)}" is not a public website address.`);
+      const list = typeof input.competitors === 'string' ? input.competitors.split(/[\s,]+/) : input.competitors || [];
+      if (!Array.isArray(list)) fail('"competitors" must be a list of website addresses.');
+      const competitors = [];
+      list.forEach((u, i) => {
+        const raw = str(u, `competitors[${i}]`, 500);
+        if (!raw) return;
+        const url = normalizeSiteUrl(raw);
+        if (!url) fail(`"${raw.slice(0, 80)}" is not a public website address.`);
+        if (!competitors.includes(url)) competitors.push(url);
+      });
+      if (competitors.length > COMPETITORS_MAX) fail(`At most ${COMPETITORS_MAX} competitor websites per task.`);
+      return {
+        type: 'competitor_research',
+        business,
+        website,
+        competitors,
+        count: competitors.length || intOf(input.count, 5, 2, COMPETITORS_MAX, 'count'),
+        location: str(input.location, 'location', 100),
+        focus: str(input.focus, 'focus', 300),
+      };
+    }
+    case 'data_collection': {
+      const raw = str(input.url, 'url', 1000);
+      if (!raw) fail('Add the address of the page with the list.');
+      const url = normalizeSiteUrl(raw);
+      if (!url) fail(`"${raw.slice(0, 80)}" is not a public website address.`);
+      return { type: 'data_collection', url, fields: str(input.fields, 'fields', 300), maxPages: intOf(input.maxPages, 1, 1, COLLECT_MAX_PAGES, 'maxPages'), instructions: str(input.instructions, 'instructions', 500) };
+    }
+    case 'crm_task': {
+      const raw = str(input.url, 'url', 1000);
+      if (!raw) fail('Add the address of your CRM.');
+      const url = normalizeSiteUrl(raw);
+      if (!url) fail(`"${raw.slice(0, 80)}" is not a public website address.`);
+      const action = ['add', 'update', 'find'].includes(input.action) ? input.action : 'add';
+      const records = str(input.records, 'records', 5000).replace(/\r\n/g, '\n');
+      const instructions = str(input.instructions, 'instructions', 1000);
+      if (!records && !instructions) fail('Add the records (one per line) or write what to do.');
+      if (records.split('\n').filter((l) => l.trim()).length > CRM_MAX_RECORDS) fail(`At most ${CRM_MAX_RECORDS} records per task.`);
+      const given = input.secrets || {};
+      const username = typeof input.username === 'string' ? input.username : given.USERNAME || '';
+      const password = typeof input.password === 'string' ? input.password : given.PASSWORD || '';
+      if (username.length > 300 || password.length > 300) fail('The login details are too long.');
+      const task = { type: 'crm_task', url, action, records, instructions, maxSteps: intOf(input.maxSteps, 40, 10, QA_MAX_STEPS, 'maxSteps'), allowOtherSites: input.allowOtherSites === true, hasLogin: Boolean(username || password) };
+      // Not enumerable: JSON (the saved task, run history, API answers, schedules) never contains them.
+      Object.defineProperty(task, 'secrets', { value: { USERNAME: username, PASSWORD: password }, enumerable: false });
+      return task;
+    }
+    case 'email_followup': {
+      const olderThanDays = intOf(input.olderThanDays, 3, 1, 30, 'olderThanDays');
+      const lookbackDays = intOf(input.lookbackDays, 30, 7, 90, 'lookbackDays');
+      if (lookbackDays <= olderThanDays) fail('Look back further than the "no reply for" days.');
+      const onlyTo = str(input.onlyTo, 'onlyTo', 200);
+      if (onlyTo && !/^[\w.+@\- ]+$/.test(onlyTo)) fail('"Only to" must be an email address or a domain, e.g. client.com.');
+      return { type: 'email_followup', olderThanDays, lookbackDays, max: intOf(input.max, 5, 1, FOLLOWUP_MAX, 'max'), mode: input.mode === 'send' ? 'send' : 'draft', notes: str(input.notes, 'notes', 500), onlyTo };
     }
     default:
       return fail(`Unknown task type "${input.type}".`);
@@ -2434,12 +2511,20 @@ const TASK_HANDLERS = {
   travel_research: (page, task, log) => require('./research-agents').runResearch(page, task, log, { normalizeSiteUrl, blockPrivateHosts, AgentError }),
   job_search: (page, task, log) => require('./research-agents').runResearch(page, task, log, { normalizeSiteUrl, blockPrivateHosts, AgentError }),
   news_research: (page, task, log) => require('./research-agents').runResearch(page, task, log, { normalizeSiteUrl, blockPrivateHosts, AgentError }),
+  // Web research, competitor research, data collection and CRM (insight-agents.js).
+  web_research: (page, task, log) => require('./insight-agents').runInsight(page, task, log, { normalizeSiteUrl, blockPrivateHosts, AgentError }),
+  competitor_research: (page, task, log) => require('./insight-agents').runInsight(page, task, log, { normalizeSiteUrl, blockPrivateHosts, AgentError }),
+  data_collection: (page, task, log) => require('./insight-agents').runInsight(page, task, log, { normalizeSiteUrl, blockPrivateHosts, AgentError }),
+  crm_task: (page, task, log) => require('./insight-agents').runInsight(page, task, log, { normalizeSiteUrl, blockPrivateHosts, AgentError }),
+  // Follow-ups to sent emails nobody answered, in Gmail (followup-agent.js).
+  email_followup: (page, task, log, { userId }) =>
+    require('./followup-agent').runFollowup(page, task, log, { SELECTORS, readMailRows, AgentError, dryRun: CONFIG.dryRun, account: getAccount(userId) }),
   // AI agent for any task on a website (web-agent.js); loaded only when used.
   web_task: (page, task, log) => require('./web-agent').runWebAgent(page, task, log, { normalizeSiteUrl, blockPrivateHosts, AgentError }),
 };
 
 /** Tasks that work inside the user's Gmail (they need "Connect Gmail" first). */
-const GMAIL_TASKS = new Set(['send_email', 'search_email', 'read_inbox']);
+const GMAIL_TASKS = new Set(['send_email', 'search_email', 'read_inbox', 'email_followup']);
 const needsGmail = (task) => GMAIL_TASKS.has(task.type);
 
 // ---------------------------------------------------------------------------
@@ -2496,7 +2581,7 @@ async function runBrowserAgent(input, { userId, onLog, dryRun = false, postProce
         throw new AgentError('LOGIN_REQUIRED', 'Gmail is not connected yet. Click "Connect Gmail" on the dashboard, sign in once, then retry.');
       }
       const context = await getContext(s, log);
-      page = await openPage(context, { regularUserAgent: !['amazon_research', 'price_check', 'qa_test', 'web_task'].includes(task.type) });
+      page = await openPage(context, { regularUserAgent: !['amazon_research', 'price_check', 'qa_test', 'web_task', 'crm_task'].includes(task.type) });
       stopScreencast = await startScreencast(page, log, s);
       if (needsGmail(task)) {
         await openGmail(page, log);
@@ -2512,7 +2597,7 @@ async function runBrowserAgent(input, { userId, onLog, dryRun = false, postProce
           log.info(`Signed the email as "${name}"`);
         }
       }
-      let result = await TASK_HANDLERS[task.type](page, task, log);
+      let result = await TASK_HANDLERS[task.type](page, task, log, { userId });
       // Optional extra step, e.g. an AI summary of search results (see planner.js).
       if (postProcess) result = await postProcess(task, result, log);
       return finish(null, result);

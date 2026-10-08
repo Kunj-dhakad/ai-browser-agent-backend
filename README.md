@@ -266,7 +266,17 @@ Research agents (research-agents.js) use the same AI engine with a ready-made pr
 - `job_search` { role, location?, remote, experience: any | entry | mid | senior, posted: day | week | month | any, count 1-50, preferences? }: LinkedIn public job pages (no login, never applies). LinkedIn's public pages ignore the remote filter, so remote searches start on RemoteOK and add LinkedIn jobs marked remote. Columns: Title, Company, Location, Posted, Salary, Work type, Notes, Link.
 - `news_research` { topic, period: day | week | month | any, region: us | in | gb | au | ca, count 1-20, readArticles (default true), focus? }: Bing News. Not a browsing AI (on news sites the model wandered to related links and made up article addresses): our code reads Bing's list and each article's text; the AI picks the articles (one request) and writes the summaries and briefing from that text only (one request). Without readArticles the summaries come from Bing's snippets. Columns: Headline, Source, Published, Summary, Link; the answer is a briefing.
 
-Indeed, Naukri and Google News block automated browsers, so they are not used. An OpenAI account without credits (or a wrong key) fails the task with a clear message instead of an empty result.
+Indeed, Naukri and Google News block automated browsers, so they are not used.
+
+More AI agents (insight-agents.js, followup-agent.js). Search engines show automated browsers poor results, so web sources are found with OpenAI's web search tool (Responses API, `web_search`); our browser then reads each page, and the model writes only from that text:
+
+- `web_research` { question, count 3-10, detail: short | detailed, focus? }: reads the sources (spares stand in for pages that can't be read) and answers citing [1], [2]... Columns: #, Title, Website, Key points, Link.
+- `competitor_research` { business, website?, competitors? (up to 8 URLs; empty = found with web search), count 2-8, location?, focus? }: reads each competitor's home page plus its pricing / about / product pages. Columns: Competitor, Website, What they offer, Pricing, Target customers, Strengths, Weaknesses; the answer is a comparison with gaps and opportunities.
+- `data_collection` { url, fields? (comma separated; empty = the AI chooses), maxPages 1-10, instructions? }: one AI request per page turns the page outline into rows; it follows only a next-page link that is really on the page.
+- `crm_task` { url, action: add | update | find, records (one per line, up to 25), instructions?, username?, password?, maxSteps 10-60 }: the custom web agent in the user's CRM, with a status row per record. Login details are kept like web_task's. It never deletes, merges, imports or messages contacts.
+- `email_followup` { olderThanDays 1-30, lookbackDays 7-90, max 1-15, mode: draft | send, onlyTo?, notes? } (needs Gmail): searches Sent mail of that period, skips conversations where someone else wrote last or that went only to automated addresses, and replies in each remaining one with an AI-written follow-up, saved as a draft (default) or sent.
+
+The browsing agents' open_page opens only addresses the pages have shown or the task contains (models made up addresses that look right and lost their steps on error pages), and clicks go to the visible copy of an element (menus often hold a hidden one). An OpenAI account without credits (or a wrong key) fails the task with a clear message instead of an empty result.
 
 All AI agents: one OpenAI request times out after `AI_REQUEST_TIMEOUT_SECONDS` (default 60, then up to 2 retries) and a whole task stops after `AI_TASK_MAX_MINUTES` (default 10), keeping the data collected so far. While the model is thinking for more than 15 s the log shows "AI is thinking…".
 

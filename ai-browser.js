@@ -185,11 +185,25 @@ async function runAgent(agent, input, { maxTurns, log, browser, label = 'The AI 
 
 /**
  * The browser tools for an agent working on `page`.
- * opts: { startUrl, allowOtherSites, maxSteps, log, normalizeSiteUrl, secrets: { USERNAME, PASSWORD } | null }
+ * opts: { startUrl, allowOtherSites, maxSteps, log, normalizeSiteUrl, secrets: { USERNAME, PASSWORD } | null, allowUrls: [] }
  * Returns { tools, oneAtATime, steps(), outOfSteps(), LIMIT }.
  */
 function createBrowserTools(page, opts) {
   const { startUrl, allowOtherSites = false, maxSteps, log, normalizeSiteUrl } = opts;
+  // Addresses open_page may open: the start page, addresses in the task (opts.allowUrls) and
+  // every link read_page has shown. Models
+  // make up addresses that look right ("/contacts", "index.php?module=...") and lose their
+  // steps on error pages; they get to open only what is really on the pages.
+  const known = new Set([startUrl, ...(opts.allowUrls || [])].map((u) => u.split('#')[0]));
+  const remember = (snapshot) => {
+    for (const m of String(snapshot).matchAll(/\/url: (\S+)/g)) {
+      try {
+        known.add(new URL(m[1], page.url()).toString().split('#')[0]);
+      } catch {
+        // not an address
+      }
+    }
+  };
   const secrets = opts.secrets || {};
   const baseHost = new URL(startUrl).hostname;
   let steps = 0;
@@ -255,10 +269,14 @@ function createBrowserTools(page, opts) {
     const quiet = await waitForQuiet();
     return `Now on ${page.url()} — "${short(await page.title(), 120)}".${quiet ? '' : ' The site is still loading something.'}${await loadingNote()}`;
   };
-  /** An element by its accessible role and name, as read_page lists them. */
-  const element = (role, name, index) => {
-    const loc = role === 'text' ? page.getByText(name, { exact: false }) : page.getByRole(role, { name, exact: false });
-    return loc.nth(index || 0);
+  /**
+   * An element by its accessible role and name, as read_page lists them. Visible matches come
+   * first: menus often hold a hidden copy of the same link, which can't be clicked.
+   */
+  const element = async (role, name, index) => {
+    const all = role === 'text' ? page.getByText(name, { exact: false }) : page.getByRole(role, { name, exact: false });
+    const visible = all.filter({ visible: true });
+    return (await visible.count()) > (index || 0) ? visible.nth(index || 0) : all.nth(index || 0);
   };
   const fail = (err) => `Failed: ${short(String(err && err.message ? err.message : err).split('\n')[0], 200)}`;
 
@@ -293,6 +311,7 @@ function createBrowserTools(page, opts) {
         if (outOfSteps()) return LIMIT;
         step('Reading the page');
         const snapshot = await page.locator('body').ariaSnapshot({ timeout: 15000 }).catch((e) => `(could not read the page: ${e.message})`);
+        remember(snapshot);
         const note = await loadingNote();
         return `URL: ${page.url()}\nTitle: ${await page.title()}${note ? `\nNote:${note}` : ''}\n\n${short(snapshot, SNAPSHOT_CHARS)}`;
       }),
@@ -310,6 +329,7 @@ function createBrowserTools(page, opts) {
           return 'Not a valid address.';
         }
         if (!allowed(url)) return allowOtherSites ? 'Not allowed: that address is not a public website.' : `Not allowed: only pages on ${baseHost} can be opened.`;
+        if (!known.has(url.split('#')[0])) return 'Not allowed: open_page opens only addresses that read_page has shown (copy a /url exactly). Find the link or menu on the page instead.';
         step(`Opening ${short(url, 100)}`);
         try {
           const { response: r, slow } = await openUrl(page, url);
@@ -327,7 +347,7 @@ function createBrowserTools(page, opts) {
         if (outOfSteps()) return LIMIT;
         step(`Clicking ${role} "${short(name, 60)}"`);
         try {
-          await element(role, name, index).click({ timeout: 8000 });
+          await (await element(role, name, index)).click({ timeout: 8000 });
           return `Clicked. ${await after()}`;
         } catch (err) {
           return fail(err);
@@ -344,7 +364,7 @@ function createBrowserTools(page, opts) {
         // the log shows the placeholder, never the real value
         step(`Typing ${secret ? text : `"${short(text, 40)}"`} into ${role} "${short(name, 50)}"${submit ? ' and pressing Enter' : ''}`);
         try {
-          const field = element(role, name, index);
+          const field = await element(role, name, index);
           const value = withSecrets(text);
           const keyByKey = !secret && (/combobox|searchbox/i.test(role) || (await looksLikeAutocomplete(field)));
           if (keyByKey) {
@@ -511,4 +531,132 @@ function createBrowserTools(page, opts) {
   return { tools, oneAtATime, steps: () => steps, outOfSteps, idleMs, LIMIT };
 }
 
-module.exports = { useOpenAI, runAgent, createBrowserTools, keepLatestPageOnly, sameSite, settle, short, sleep, usageOf, openUrl };
+
+// ---------------------------------------------------------------- code-driven AI helpers
+// The research agents that don't browse with the AI (news, web research, competitors, data
+// collection, follow-ups): our code reads the pages, the model answers in JSON.
+
+/** The model for the AI agents. */
+const aiModel = () => process.env.WEB_AGENT_MODEL || process.env.QA_MODEL || process.env.OPENAI_MODEL || 'gpt-4.1-mini';
+
+let jsonClient = null;
+function client() {
+  if (!jsonClient) jsonClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, baseURL: process.env.OPENAI_BASE_URL || undefined, timeout: AI_REQUEST_TIMEOUT_MS, maxRetries: 2 });
+  return jsonClient;
+}
+
+/** An OpenAI error as an AgentError the user can act on. */
+function aiFailure(err, AgentError) {
+  const msg = String((err && err.message) || err);
+  if (/no credits|insufficient_quota|quota|billing/i.test(msg)) return new AgentError('AI_UNAVAILABLE', 'The OpenAI account has no credits left. Add credits at platform.openai.com (Settings → Billing), then run the task again.');
+  if (err && err.status === 401) return new AgentError('AI_UNAVAILABLE', 'The OpenAI API key is not valid. Check OPENAI_API_KEY in backend/.env.');
+  return new AgentError('AI_ERROR', `The AI could not answer: ${short(msg, 200)}`);
+}
+
+/** The usage of one request in our shape. */
+const oneRequest = (inputTokens, outputTokens) => ({ requests: 1, inputTokens: inputTokens || 0, outputTokens: outputTokens || 0 });
+
+/** Adds b's usage into a ({ requests, inputTokens, outputTokens }). */
+function addUsage(a, b) {
+  ['requests', 'inputTokens', 'outputTokens'].forEach((k) => (a[k] = (a[k] || 0) + ((b && b[k]) || 0)));
+  return a;
+}
+
+/** One JSON answer from the model. Returns { data, usage }. */
+async function askJson(model, system, user, AgentError) {
+  let completion;
+  try {
+    completion = await client().chat.completions.create({
+      model,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+    });
+  } catch (err) {
+    throw aiFailure(err, AgentError);
+  }
+  let data = {};
+  try {
+    data = JSON.parse((completion.choices[0] && completion.choices[0].message.content) || '{}');
+  } catch {
+    // keep {}
+  }
+  const u = completion.usage || {};
+  return { data, usage: oneRequest(u.prompt_tokens, u.completion_tokens) };
+}
+
+/**
+ * Web pages about `request`, found with OpenAI's web search (search engines show automated
+ * browsers poor results). Returns { sources: [{ title, url }], text, usage }.
+ */
+async function findSources(model, request, AgentError) {
+  let r;
+  try {
+    r = await client().responses.create({ model, tools: [{ type: 'web_search' }], include: ['web_search_call.action.sources'], input: request });
+  } catch (err) {
+    throw aiFailure(err, AgentError);
+  }
+  const clean = (u) => String(u || '').replace(/[?&]utm_source=openai$/, '').replace(/\?$/, '');
+  const sources = [];
+  const add = (url, title) => {
+    const u = clean(url);
+    if (/^https?:\/\//i.test(u) && !sources.some((x) => x.url === u)) sources.push({ url: u, title: String(title || '').trim() });
+  };
+  const message = (r.output || []).find((o) => o.type === 'message');
+  const parts = (message && message.content) || [];
+  parts.forEach((c) => (c.annotations || []).forEach((x) => x.type === 'url_citation' && add(x.url, x.title)));
+  (r.output || []).filter((o) => o.type === 'web_search_call').forEach((o) => ((o.action && o.action.sources) || []).forEach((x) => add(x.url, '')));
+  const u = r.usage || {};
+  return { sources, text: parts.map((c) => c.text || '').join('\n'), usage: oneRequest(u.input_tokens, u.output_tokens) };
+}
+
+/** The page's own text: paragraphs and list items in <article>, else <main>, else the page. */
+async function readPageText(page) {
+  return page
+    .evaluate(() => {
+      const parts = (sel) => [...document.querySelectorAll(sel)].map((p) => p.innerText.replace(/\s+/g, ' ').trim()).filter((t) => t.length > 40);
+      let ps = parts('article p, article li');
+      if (ps.join(' ').length < 400) ps = parts('main p, main li, main h2, main h3');
+      if (ps.join(' ').length < 400) ps = parts('p, li, h1, h2, h3');
+      return [...new Set(ps)].join('\n');
+    })
+    .catch(() => '');
+}
+
+/** Opens `url` and returns its text ('' when it doesn't load in time). */
+async function readUrl(page, url, maxChars = 4000) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 25000 });
+      await sleep(1500);
+      return (await readPageText(page)).slice(0, maxChars);
+    } catch (err) {
+      // After a failed page Chrome loads its own error page, which cuts off the next
+      // navigation ("interrupted by another navigation"): give it a moment and try once more.
+      await sleep(2000);
+      if (!/interrupted|ERR_ABORTED/i.test(String(err && err.message))) return '';
+    }
+  }
+  return '';
+}
+
+module.exports = {
+  useOpenAI,
+  runAgent,
+  createBrowserTools,
+  keepLatestPageOnly,
+  sameSite,
+  settle,
+  short,
+  sleep,
+  usageOf,
+  openUrl,
+  aiModel,
+  askJson,
+  addUsage,
+  findSources,
+  readPageText,
+  readUrl,
+};

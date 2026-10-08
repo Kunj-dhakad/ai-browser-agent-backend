@@ -15,12 +15,10 @@
  * ---------------------------------------------------------------------------
  */
 
-const OpenAI = require('openai');
 const { runWebAgent, WORKING_RULES } = require('./web-agent');
-const { useOpenAI, openUrl, sleep } = require('./ai-browser');
+const { useOpenAI, openUrl, sleep, askJson, addUsage, readPageText, aiModel } = require('./ai-browser');
 
 const enc = encodeURIComponent;
-const MODEL = () => process.env.WEB_AGENT_MODEL || process.env.QA_MODEL || process.env.OPENAI_MODEL || 'gpt-4.1-mini';
 
 const COLUMNS = {
   travel_research: ['Type', 'Name', 'Price', 'Details', 'Rating', 'Link'],
@@ -174,55 +172,11 @@ async function readBingNews(page) {
   );
 }
 
-/** The article's own text: paragraphs in <article>, else <main>, else the page. */
-async function readArticleText(page) {
-  return page
-    .evaluate(() => {
-      const paras = (sel) => [...document.querySelectorAll(sel)].map((p) => p.innerText.replace(/\s+/g, ' ').trim()).filter((t) => t.length > 60);
-      let ps = paras('article p');
-      if (ps.join(' ').length < 400) ps = paras('main p');
-      if (ps.join(' ').length < 400) ps = paras('p');
-      return ps.join('\n');
-    })
-    .catch(() => '');
-}
-
-let newsClient = null;
-/** One JSON answer from the model. Returns { data, usage }. */
-async function askJson(model, system, user, AgentError) {
-  if (!newsClient) newsClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY, baseURL: process.env.OPENAI_BASE_URL || undefined, timeout: 60000, maxRetries: 2 });
-  let completion;
-  try {
-    completion = await newsClient.chat.completions.create({
-      model,
-      response_format: { type: 'json_object' },
-      messages: [
-        { role: 'system', content: system },
-        { role: 'user', content: user },
-      ],
-    });
-  } catch (err) {
-    if (/no credits|insufficient_quota|quota|billing/i.test(err.message)) throw new AgentError('AI_UNAVAILABLE', 'The OpenAI account has no credits left. Add credits at platform.openai.com (Settings → Billing), then run the task again.');
-    if (err.status === 401) throw new AgentError('AI_UNAVAILABLE', 'The OpenAI API key is not valid. Check OPENAI_API_KEY in backend/.env.');
-    throw new AgentError('AI_ERROR', `The AI could not answer: ${String(err.message).slice(0, 200)}`);
-  }
-  const text = (completion.choices[0] && completion.choices[0].message.content) || '{}';
-  let data = {};
-  try {
-    data = JSON.parse(text);
-  } catch {
-    // keep {}
-  }
-  const u = completion.usage || {};
-  return { data, usage: { requests: 1, inputTokens: u.prompt_tokens || 0, outputTokens: u.completion_tokens || 0 } };
-}
-
 async function newsResearch(page, task, log, { normalizeSiteUrl, blockPrivateHosts, AgentError }) {
   if (!useOpenAI()) throw new AgentError('AI_REQUIRED', 'The news agent needs an OpenAI API key (OPENAI_API_KEY in backend/.env).');
-  const model = MODEL();
+  const model = aiModel();
   const url = newsUrl(task);
   const usage = { requests: 0, inputTokens: 0, outputTokens: 0 };
-  const add = (u) => ['requests', 'inputTokens', 'outputTokens'].forEach((k) => (usage[k] += u[k]));
   const focus = task.focus ? `\nWhat the reader wants to know: ${task.focus}` : '';
 
   await blockPrivateHosts(page, { skipMedia: true });
@@ -249,7 +203,7 @@ async function newsResearch(page, task, log, { normalizeSiteUrl, blockPrivateHos
     `Topic: ${task.topic}${focus}\nPick ${task.count}.\n\nArticles:\n${cards.map((c, i) => `${i + 1}. ${c.title} — ${c.source}${c.published ? `, ${c.published}` : ''}${c.snippet ? `: ${c.snippet.slice(0, 200)}` : ''}`).join('\n')}`,
     AgentError,
   );
-  add(picked.usage);
+  addUsage(usage, picked.usage);
   let chosen = (Array.isArray(picked.data.picked) ? picked.data.picked : [])
     .map((n) => cards[Number(n) - 1])
     .filter((c, i, a) => c && a.indexOf(c) === i);
@@ -266,7 +220,7 @@ async function newsResearch(page, task, log, { normalizeSiteUrl, blockPrivateHos
     try {
       await page.goto(c.url, { waitUntil: 'domcontentloaded', timeout: 25000 });
       await sleep(1500);
-      c.text = (await readArticleText(page)).slice(0, NEWS_TEXT_CHARS);
+      c.text = (await readPageText(page)).slice(0, NEWS_TEXT_CHARS);
     } catch {
       // slow or blocked: the summary comes from Bing's snippet
     }
@@ -288,7 +242,7 @@ async function newsResearch(page, task, log, { normalizeSiteUrl, blockPrivateHos
     `Topic: ${task.topic}${focus}\n\n${chosen.map((c, i) => `### Article ${i + 1}: ${c.title}\nSource: ${c.source}${c.published ? ` (${c.published})` : ''}\n${c.text || `Snippet: ${c.snippet || '(none)'}`}`).join('\n\n')}`,
     AgentError,
   );
-  add(written.usage);
+  addUsage(usage, written.usage);
   const summaries = new Map((Array.isArray(written.data.articles) ? written.data.articles : []).map((a) => [Number(a.n), String(a.summary || '').trim()]));
   const rows = chosen.map((c, i) => [c.title, c.source, c.published, summaries.get(i + 1) || c.snippet, c.url]);
   log.success(`Summed up ${rows.length} article(s)`);

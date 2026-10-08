@@ -38,6 +38,8 @@ ${WORKING_RULES(site, hasLogin, allowOtherSites)}`;
 const WORKING_RULES = (site, hasLogin, allowOtherSites) => `How to work:
 - The start page is already open: start with read_page. Find elements by their role and name exactly as read_page lists them (e.g. button "Sign in", link "Orders", textbox "Search").
 - After an action, call read_page again when you need to see the result.
+- Menus are often closed: links you need may sit behind a menu button (☰, "Menu", "More", or a button with no name, usually top-left). Click it, then read_page again.
+- If clicking a link fails, open its /url from read_page with open_page instead. Only open addresses that read_page showed or the user gave you: never guess or make up an address.
 - ${hasLogin ? 'If you need to log in, type {{USERNAME}} into the username / email field and {{PASSWORD}} into the password field, exactly like that. The real values are filled in for you; you never see them and must never ask for them.' : 'No login details were given. If the task needs a login, stop and say so in your answer.'}
 - When the page has a table, use read_tables to read it exactly. Save the data the user asked for with save_data: one row per item, short clear column names, the values exactly as the page shows them. Never invent or guess values; leave a cell empty if the page doesn't show it. Whenever the task asks for data, a list, values or details, save them with save_data before you answer, even if it is a single value.
 - Use check_text to confirm a value before you report it.
@@ -74,8 +76,8 @@ function addUsage(a, b) {
  * Runs the custom web agent on `page` (already in the user's browser) and returns
  * { url, answer, data: { columns, rows }, steps, stoppedEarly, finalUrl, usedLogin, usage }.
  * helpers: { normalizeSiteUrl, blockPrivateHosts, AgentError }
- * preset (research agents): { name, instructions, columns, prepare? } — their own prompt, the
- * table always has exactly these columns, and prepare(page, log) runs before the AI starts.
+ * preset (research agents): { name, instructions, columns?, prepare? } — their own prompt, the
+ * table has exactly these columns when given, and prepare(page, log) runs before the AI starts.
  */
 async function runWebAgent(page, task, log, helpers, preset = null) {
   const { normalizeSiteUrl, blockPrivateHosts, AgentError } = helpers;
@@ -94,11 +96,14 @@ async function runWebAgent(page, task, log, helpers, preset = null) {
   if (preset && preset.prepare) await preset.prepare(page, log);
 
   // The data the model collects: one table, columns merged by name (case does not matter).
-  const data = { columns: preset ? preset.columns.slice() : [], rows: [] };
-  const maxColumns = preset ? preset.columns.length : WEB.maxColumns;
+  const data = { columns: preset && preset.columns ? preset.columns.slice() : [], rows: [] };
+  const maxColumns = preset && preset.columns ? preset.columns.length : WEB.maxColumns;
   const columnAt = (n) => data.columns.findIndex((c) => c.toLowerCase() === n.toLowerCase());
+  const prompt = preset ? preset.instructions : INSTRUCTIONS(startUrl, task, hasLogin, task.allowOtherSites);
   const browser = createBrowserTools(page, {
     startUrl,
+    // addresses written in the task may be opened too
+    allowUrls: (prompt.match(/https?:\/\/[^\s)"'<>]+/g) || []).map((u) => u.replace(/[.,;:]+$/, '')),
     allowOtherSites: task.allowOtherSites,
     maxSteps: task.maxSteps,
     log,
@@ -142,7 +147,7 @@ async function runWebAgent(page, task, log, helpers, preset = null) {
   const agent = new Agent({
     name: preset ? preset.name : 'Custom web agent',
     model: WEB.model,
-    instructions: preset ? preset.instructions : INSTRUCTIONS(startUrl, task, hasLogin, task.allowOtherSites),
+    instructions: prompt,
     tools,
     modelSettings: { parallelToolCalls: false },
   });
