@@ -60,6 +60,9 @@ function givePage() {
   else pagesInUse--;
 }
 
+/** Sent when the agent stopped after describing its next steps instead of doing them. */
+const CARRY_ON = "Don't describe what you will do: do it now with the tools and finish the task (save the data with save_data), then give your final answer.";
+
 // ---------------------------------------------------------------- the agent's prompt
 
 const PROMPT = (lane, site, hasLogin, allowOtherSites) => `You are the user's Super Agent: an assistant that does tasks for them in a real web browser.
@@ -306,13 +309,29 @@ async function runTurn(lane, turn) {
     // the earlier messages (and what the agent did) carry over, so follow-ups continue the work
     const input = lane.history ? [...lane.history, { role: 'user', content: turn.message }] : turn.n === 1 ? 'Do the task now.' : turn.message;
     if (turn.n === 1) log.action(`Super Agent (${WEB.model}) is working on it, up to ${LIMITS.stepsPerTurn} steps`);
-    const out = await runAgent(agent, input, { maxTurns: LIMITS.stepsPerTurn * 2 + 10, log, browser, label: 'The agent', signal: lane.abort.signal });
+    let out = await runAgent(agent, input, { maxTurns: LIMITS.stepsPerTurn * 2 + 10, log, browser, label: 'The agent', signal: lane.abort.signal });
     if (out.stopped === 'account') throw new AgentError('AI_UNAVAILABLE', out.message);
+    let usage = out.usage;
+    // The model sometimes stops after saying what it will do next ("Now I will sort them and
+    // save the 10 cheapest…") without doing it: tell it to carry on (at most twice).
+    for (let nudge = 0; nudge < 2 && out.result && !data.rows.length && !lane.abort.signal.aborted; nudge++) {
+      const said = String(out.result.finalOutput || '');
+      const promise = /\b(I will|I'll|I am going to|I'm going to|Let me|Next,? I|Now,? I will|I need to)\b/i.test(said) && !/\?\s*$/.test(said);
+      if (!promise || browser.outOfSteps()) break;
+      log.info('Continuing: the agent said what it would do next but stopped');
+      const again = await runAgent(agent, [...out.result.history, { role: 'user', content: CARRY_ON }], { maxTurns: LIMITS.stepsPerTurn * 2 + 10, log, browser, label: 'The agent', signal: lane.abort.signal });
+      usage = addUsage(usage, again.usage);
+      if (!again.result) {
+        out = { ...again, result: out.result };
+        break;
+      }
+      out = again;
+    }
     if (out.result) lane.history = out.result.history;
     lane.lastUrl = page.url() !== 'about:blank' ? page.url() : lane.lastUrl;
     turn.finalUrl = lane.lastUrl;
     turn.data = data;
-    turn.usage = usageOf(out.usage, WEB.model);
+    turn.usage = usageOf(usage, WEB.model);
     turn.answer = out.result ? scrub(String(out.result.finalOutput || '').trim()) : '';
     if (out.stopped === 'user') {
       turn.status = 'stopped';
@@ -323,8 +342,9 @@ async function runTurn(lane, turn) {
         if (out.stopped === 'time') turn.answer += ' It reached the time limit.';
         else if (out.stopped === 'steps') turn.answer += ' It used all its steps for this message.';
       }
-      // a question for the user ends the turn waiting for their reply
-      turn.status = /\?\s*$/.test(turn.answer) ? 'waiting' : 'done';
+      // a question for the user (and nothing saved) ends the turn waiting for their reply; a
+      // finished task that only offers more ("Want me to …?") is done
+      turn.status = /\?\s*$/.test(turn.answer) && !data.rows.length ? 'waiting' : 'done';
     }
     log.success(`Done in ${browser.steps()} steps${data.rows.length ? `: ${data.rows.length} row(s) of data` : ''}`);
     await shoot(lane, turn, page, 'End', { final: true });
