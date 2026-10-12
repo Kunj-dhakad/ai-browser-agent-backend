@@ -142,9 +142,15 @@ async function readSuggestions(page) {
  * running for a while) writes "AI is thinking…" to the log so the task doesn't look stuck.
  * Returns { result, usage, stopped }: stopped is null, 'steps', 'time' or the error message.
  */
-async function runAgent(agent, input, { maxTurns, log, browser, label = 'The AI agent' }) {
+async function runAgent(agent, input, { maxTurns, log, browser, label = 'The AI agent', signal }) {
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), AI_TASK_LIMIT_MS);
+  // signal: the user pressed Stop (super agent)
+  const onStop = () => abort.abort();
+  if (signal) {
+    if (signal.aborted) abort.abort();
+    else signal.addEventListener('abort', onStop, { once: true });
+  }
   let lastNote = 0;
   const heartbeat = setInterval(() => {
     const idle = browser.idleMs();
@@ -159,7 +165,10 @@ async function runAgent(agent, input, { maxTurns, log, browser, label = 'The AI 
   } catch (err) {
     const usage = err && err.state && err.state.usage ? err.state.usage : null;
     let stopped;
-    if (abort.signal.aborted) {
+    if (signal && signal.aborted) {
+      stopped = 'user';
+      log.warn(`${label} was stopped`);
+    } else if (abort.signal.aborted) {
       stopped = 'time';
       log.warn(`${label} reached the time limit (${Math.round(AI_TASK_LIMIT_MS / 60000)} min) and stopped`);
     } else if (/max turns/i.test(err && err.message)) {
@@ -180,6 +189,7 @@ async function runAgent(agent, input, { maxTurns, log, browser, label = 'The AI 
   } finally {
     clearTimeout(timer);
     clearInterval(heartbeat);
+    if (signal) signal.removeEventListener('abort', onStop);
   }
 }
 
@@ -528,7 +538,9 @@ function createBrowserTools(page, opts) {
   ];
 
   const idleMs = () => (busy ? 0 : Date.now() - lastActivity);
-  return { tools, oneAtATime, steps: () => steps, outOfSteps, idleMs, LIMIT };
+  /** Lets open_page open this address too (e.g. a search result the agent found). */
+  const allowUrl = (u) => known.add(String(u).split('#')[0]);
+  return { tools, oneAtATime, steps: () => steps, outOfSteps, idleMs, allowUrl, LIMIT };
 }
 
 

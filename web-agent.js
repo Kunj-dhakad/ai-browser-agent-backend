@@ -35,7 +35,8 @@ ${task.instructions}
 ${WORKING_RULES(site, hasLogin, allowOtherSites)}`;
 
 /** How the agent works: shared by the custom web agent and the research agents. */
-const WORKING_RULES = (site, hasLogin, allowOtherSites) => `How to work:
+/** canAsk: the user can answer in a chat (super agent); otherwise nobody answers mid-task. */
+const WORKING_RULES = (site, hasLogin, allowOtherSites, canAsk = false) => `How to work:
 - The start page is already open: start with read_page. Find elements by their role and name exactly as read_page lists them (e.g. button "Sign in", link "Orders", textbox "Search").
 - After an action, call read_page again when you need to see the result.
 - Menus are often closed: links you need may sit behind a menu button (☰, "Menu", "More", or a button with no name, usually top-left). Click it, then read_page again.
@@ -49,7 +50,7 @@ const WORKING_RULES = (site, hasLogin, allowOtherSites) => `How to work:
 - When the task is done (or you are nearly out of steps), stop calling tools and answer in plain words: what you did, and the result (the main values, or a short summary of the data saved). If something stopped you, say exactly what.
 
 Decide for yourself:
-- You cannot ask the user anything during the task and nobody will answer. Never end with a question or "let me know". When something is unclear, pick the most sensible reading of the task and do it.
+- ${canAsk ? 'Decide for yourself whenever you sensibly can. Ask the user only when you truly need something only they can give or decide: a one-time code, a choice between real options, or a yes before you send, submit, buy, book or delete anything. Then stop and ask one short, clear question; the user answers in the chat.' : 'You cannot ask the user anything during the task and nobody will answer. Never end with a question or "let me know". When something is unclear, pick the most sensible reading of the task and do it.'}
 - When a way doesn't work, try another before giving up: a different field or button, the suggestion list, a menu, a simpler search term, another page of the site.
 
 Rules:
@@ -60,7 +61,7 @@ Rules:
 - Don't repeat the same failing action more than twice; try another way or stop and explain.
 - When you have about 3 steps left, finish with your answer.
 
-Before your final answer, check: the data the task asks for is saved with save_data, and the answer has no question in it.`;
+Before your final answer, check: the data the task asks for is saved with save_data${canAsk ? '' : ', and the answer has no question in it'}.`;
 
 // A task that asks for data back (vs. "log in and check the page works").
 const WANTS_DATA = /\b(data|list|table|give me|get me|extract|collect|details|names?|prices?|emails?|phones?|numbers?|values?|find)\b/i;
@@ -95,61 +96,17 @@ async function runWebAgent(page, task, log, helpers, preset = null) {
   log.info(`The site answered ${response ? response.status() : 'nothing'}${hasLogin ? '; login details are ready (hidden from the AI)' : ''}`);
   if (preset && preset.prepare) await preset.prepare(page, log);
 
-  // The data the model collects: one table, columns merged by name (case does not matter).
-  const data = { columns: preset && preset.columns ? preset.columns.slice() : [], rows: [] };
-  const maxColumns = preset && preset.columns ? preset.columns.length : WEB.maxColumns;
-  const columnAt = (n) => data.columns.findIndex((c) => c.toLowerCase() === n.toLowerCase());
   const prompt = preset ? preset.instructions : INSTRUCTIONS(startUrl, task, hasLogin, task.allowOtherSites);
-  const browser = createBrowserTools(page, {
+  const { agent, browser, data, scrub } = buildWebAgent(page, {
+    name: preset ? preset.name : 'Custom web agent',
+    prompt,
     startUrl,
-    // addresses written in the task may be opened too
-    allowUrls: (prompt.match(/https?:\/\/[^\s)"'<>]+/g) || []).map((u) => u.replace(/[.,;:]+$/, '')),
+    columns: preset && preset.columns,
     allowOtherSites: task.allowOtherSites,
     maxSteps: task.maxSteps,
+    secrets,
     log,
     normalizeSiteUrl,
-    secrets,
-  });
-  const secretValues = [secrets.USERNAME, secrets.PASSWORD].filter((v) => v && String(v).length >= 3);
-  // Never let a login value end up in the saved data or the answer.
-  const scrub = (v) => secretValues.reduce((out, sv) => out.split(sv).join('••••'), String(v == null ? '' : v));
-
-  const tools = [
-    ...browser.tools,
-    tool({
-      name: 'save_data',
-      description: 'Save rows of the data the user asked for. columns = the column names; rows = one array of cell values per item, in the same order as columns. Call it again to add more rows.',
-      parameters: z.object({ columns: z.array(z.string()), rows: z.array(z.array(z.string())) }),
-      execute: browser.oneAtATime(async ({ columns, rows }) => {
-        const names = columns.map((c) => short(String(c).trim() || 'Value', 60));
-        names.forEach((n) => {
-          if (columnAt(n) < 0 && data.columns.length < maxColumns) data.columns.push(n);
-        });
-        let added = 0;
-        rows.forEach((r) => {
-          if (data.rows.length >= WEB.maxRows) return;
-          const row = data.columns.map(() => '');
-          names.forEach((n, i) => {
-            const at = columnAt(n);
-            if (at >= 0) row[at] = short(scrub(r[i]), 500);
-          });
-          if (row.some(Boolean)) {
-            data.rows.push(row);
-            added++;
-          }
-        });
-        log.success(`Saved ${added} row(s) of data (${data.rows.length} in total)`);
-        return `Saved ${added} row(s); ${data.rows.length} row(s) saved so far.`;
-      }),
-    }),
-  ];
-
-  const agent = new Agent({
-    name: preset ? preset.name : 'Custom web agent',
-    model: WEB.model,
-    instructions: prompt,
-    tools,
-    modelSettings: { parallelToolCalls: false },
   });
 
   log.action(`AI agent (${WEB.model}) is working on the task, up to ${task.maxSteps} steps`);
@@ -188,4 +145,72 @@ async function runWebAgent(page, task, log, helpers, preset = null) {
   };
 }
 
-module.exports = { runWebAgent, WORKING_RULES };
+/**
+ * The web agent itself (also used by super-agent.js, one per turn): the browser tools on
+ * `page` plus save_data. Returns { agent, browser, data, scrub }; data is the table save_data
+ * fills, scrub(text) masks the login values.
+ * opts: { name, prompt, startUrl, columns?, allowOtherSites, maxSteps, secrets, log, normalizeSiteUrl, extraTools? }
+ */
+function buildWebAgent(page, opts) {
+  const { prompt, startUrl, log, normalizeSiteUrl } = opts;
+  const secrets = opts.secrets || {};
+  // The data the model collects: one table, columns merged by name (case does not matter).
+  const data = { columns: opts.columns ? opts.columns.slice() : [], rows: [] };
+  const maxColumns = opts.columns ? opts.columns.length : WEB.maxColumns;
+  const columnAt = (n) => data.columns.findIndex((c) => c.toLowerCase() === n.toLowerCase());
+  const browser = createBrowserTools(page, {
+    startUrl,
+    // addresses written in the task may be opened too
+    allowUrls: (prompt.match(/https?:\/\/[^\s)"'<>]+/g) || []).map((u) => u.replace(/[.,;:]+$/, '')),
+    allowOtherSites: opts.allowOtherSites,
+    maxSteps: opts.maxSteps,
+    log,
+    normalizeSiteUrl,
+    secrets,
+  });
+  const secretValues = [secrets.USERNAME, secrets.PASSWORD].filter((v) => v && String(v).length >= 3);
+  // Never let a login value end up in the saved data or the answer.
+  const scrub = (v) => secretValues.reduce((out, sv) => out.split(sv).join('••••'), String(v == null ? '' : v));
+
+  const tools = [
+    ...browser.tools,
+    ...(opts.extraTools ? opts.extraTools(browser) : []),
+    tool({
+      name: 'save_data',
+      description: 'Save rows of the data the user asked for. columns = the column names; rows = one array of cell values per item, in the same order as columns. Call it again to add more rows.',
+      parameters: z.object({ columns: z.array(z.string()), rows: z.array(z.array(z.string())) }),
+      execute: browser.oneAtATime(async ({ columns, rows }) => {
+        const names = columns.map((c) => short(String(c).trim() || 'Value', 60));
+        names.forEach((n) => {
+          if (columnAt(n) < 0 && data.columns.length < maxColumns) data.columns.push(n);
+        });
+        let added = 0;
+        rows.forEach((r) => {
+          if (data.rows.length >= WEB.maxRows) return;
+          const row = data.columns.map(() => '');
+          names.forEach((n, i) => {
+            const at = columnAt(n);
+            if (at >= 0) row[at] = short(scrub(r[i]), 500);
+          });
+          if (row.some(Boolean)) {
+            data.rows.push(row);
+            added++;
+          }
+        });
+        log.success(`Saved ${added} row(s) of data (${data.rows.length} in total)`);
+        return `Saved ${added} row(s); ${data.rows.length} row(s) saved so far.`;
+      }),
+    }),
+  ];
+
+  const agent = new Agent({
+    name: opts.name || 'Custom web agent',
+    model: WEB.model,
+    instructions: prompt,
+    tools,
+    modelSettings: { parallelToolCalls: false },
+  });
+  return { agent, browser, data, scrub };
+}
+
+module.exports = { runWebAgent, buildWebAgent, WORKING_RULES, WEB, addUsage };

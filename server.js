@@ -71,6 +71,7 @@ const {
 const { planTask, createSummarizer, aiStatus } = require('./planner');
 const { startScheduler, stopScheduler, createSchedule, listSchedules, deleteSchedule, deleteUserSchedules } = require('./scheduler');
 const { users, usage, runHistory, publicUser } = require('./db');
+const superAgent = require('./super-agent');
 const auth = require('./auth');
 
 const PORT = parseInt(process.env.PORT, 10) || 4000;
@@ -149,7 +150,12 @@ function statusForError(code) {
     case 'RUN_NOT_FOUND':
     case 'SCHEDULE_NOT_FOUND':
     case 'USER_NOT_FOUND':
+    case 'LANE_NOT_FOUND':
+    case 'SHOT_NOT_FOUND':
       return 404;
+    case 'LANE_LIMIT':
+    case 'LANE_BUSY':
+      return 409;
     case 'ALREADY_LOGGED_IN':
     case 'NO_LOGIN':
     case 'EMAIL_TAKEN':
@@ -827,6 +833,47 @@ app.delete('/api/agent/schedules/:id', (req, res) => {
   if (deleteSchedule(req.params.id, req.user.id)) return res.json({ success: true });
   res.status(404).json({ success: false, error: { code: 'SCHEDULE_NOT_FOUND', message: 'This schedule no longer exists.' } });
 });
+
+// ---------------------------------------------------------------------------
+// Super Agent (super-agent.js): up to 3 tasks at once per user, each a chat with follow-ups
+// ---------------------------------------------------------------------------
+
+app.get('/api/super/lanes', (req, res) => res.json({ success: true, ...superAgent.listLanes(req.user.id) }));
+
+app.post(
+  '/api/super/lanes',
+  route(async (req, res) => {
+    res.status(201).json({ success: true, lane: superAgent.startLane(req.user.id, req.body || {}) });
+  })
+);
+
+app.post(
+  '/api/super/lanes/:id/messages',
+  route(async (req, res) => {
+    res.json({ success: true, lane: superAgent.followUp(req.user.id, req.params.id, req.body || {}) });
+  })
+);
+
+app.post(
+  '/api/super/lanes/:id/stop',
+  route(async (req, res) => {
+    res.json({ success: true, lane: superAgent.stopLane(req.user.id, req.params.id) });
+  })
+);
+
+app.delete(
+  '/api/super/lanes/:id',
+  route(async (req, res) => {
+    res.json({ success: true, ...superAgent.clearLane(req.user.id, req.params.id) });
+  })
+);
+
+app.get(
+  '/api/super/lanes/:id/shots/:shot',
+  route(async (req, res) => {
+    res.json({ success: true, shot: superAgent.getShot(req.user.id, req.params.id, req.params.shot) });
+  })
+);
 
 // ---------------------------------------------------------------------------
 // Fallbacks

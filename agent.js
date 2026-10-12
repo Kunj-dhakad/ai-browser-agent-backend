@@ -850,6 +850,7 @@ function userSession(userId) {
       contextPromise: null,
       queue: Promise.resolve(),
       pending: 0, // tasks queued or running (a sign-in counts as one)
+      parallel: 0, // super agent pages open alongside the queue
       lastUsed: Date.now(),
       idleTimer: null,
       login: null, // sign-in in progress (Connect Gmail)
@@ -894,7 +895,7 @@ function launchOptions(overrides = {}) {
   };
 }
 
-const isIdle = (s) => s.pending === 0 && !s.login;
+const isIdle = (s) => s.pending === 0 && !s.parallel && !s.login;
 
 /** Wakes the first user waiting in line, so they can take a freed (or now idle) browser. */
 function wakeOneWaiter() {
@@ -2682,8 +2683,44 @@ if (require.main === module) {
   });
 }
 
+/**
+ * A page in the user's own browser for work that runs alongside their queued tasks (super
+ * agent lanes, up to 3 at once). The browser counts as busy while the page is held, so it is
+ * not closed for being idle. Returns { page, release }; call release() when done.
+ */
+async function openParallelPage(userId, log) {
+  const s = userSession(userId);
+  s.parallel++;
+  clearTimeout(s.idleTimer);
+  let page = null;
+  let released = false;
+  const release = async () => {
+    if (released) return;
+    released = true;
+    if (page && !page.isClosed()) await page.close().catch(() => {});
+    s.parallel--;
+    s.lastUsed = Date.now();
+    if (isIdle(s)) {
+      scheduleIdleClose(s);
+      wakeOneWaiter();
+    }
+  };
+  try {
+    const context = await getContext(s, log);
+    page = await openPage(context, { regularUserAgent: false });
+    return { page, release };
+  } catch (err) {
+    await release();
+    throw err;
+  }
+}
+
 module.exports = {
   runBrowserAgent,
+  openParallelPage,
+  createLogger,
+  normalizeSiteUrl,
+  blockPrivateHosts,
   parseCommand,
   validateTask,
   checkSession,
