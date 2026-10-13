@@ -313,7 +313,7 @@ async function runTurn(lane, turn) {
     });
     // the earlier messages (and what the agent did) carry over, so follow-ups continue the work
     const input = lane.history ? [...lane.history, { role: 'user', content: turn.message }] : turn.n === 1 ? 'Do the task now.' : turn.message;
-    if (turn.n === 1) log.action(`Super Agent (${WEB.model}) is working on it, up to ${LIMITS.stepsPerTurn} steps`);
+    if (turn.n === 1) log.action(`Super Agent is working on it, up to ${LIMITS.stepsPerTurn} steps`);
     let out = await runAgent(agent, input, { maxTurns: LIMITS.stepsPerTurn * 2 + 10, log, browser, label: 'The agent', signal: lane.abort.signal });
     if (out.stopped === 'account') throw new AgentError('AI_UNAVAILABLE', out.message);
     let usage = out.usage;

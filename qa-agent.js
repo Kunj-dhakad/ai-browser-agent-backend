@@ -156,7 +156,7 @@ async function runQaAgent(page, task, log, helpers) {
     modelSettings: { parallelToolCalls: false },
   });
 
-  log.action(`AI tester (${QA.model}) is testing the site, up to ${task.maxSteps} steps`);
+  log.action(`The tester is testing the site, up to ${task.maxSteps} steps`);
   // Out of steps, out of time or the model failed: keep everything recorded so far.
   const out = await runAgent(agent, `Test ${startUrl} now.`, { maxTurns: task.maxSteps * 2 + 10, log, browser, label: 'The AI tester' });
   const usage = out.usage;

@@ -87,7 +87,7 @@ async function webResearch(page, task, log, { normalizeSiteUrl, blockPrivateHost
     return result(task, sources[0].url, 'None of the sources could be read (they blocked the browser or were empty). Try again or ask in other words.', COLUMNS.web_research, sources.map((s, i) => [String(i + 1), s.title, domainOf(s.url), '', s.url]), steps, page, usage, model);
   }
 
-  log.action(`AI (${model}) is writing the answer from ${read.length} source(s)`);
+  log.action(`Writing the answer from ${read.length} source(s)`);
   const written = await askJson(
     model,
     'You are a careful researcher. Answer the question using ONLY the numbered sources given (never your own knowledge). ' +
@@ -178,7 +178,7 @@ async function competitorResearch(page, task, log, { normalizeSiteUrl, blockPriv
     if (!c.text) log.warn(`Could not read ${domainOf(c.url)}; it is listed without details`);
   }
 
-  log.action(`AI (${model}) is comparing ${list.length} competitor(s)`);
+  log.action(`Comparing ${list.length} competitor(s)`);
   const written = await askJson(
     model,
     'You are a market analyst. Using ONLY the website text given (never your own knowledge), describe each competitor and compare them with the user\'s business. ' +

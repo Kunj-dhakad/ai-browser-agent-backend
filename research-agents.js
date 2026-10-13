@@ -196,7 +196,7 @@ async function newsResearch(page, task, log, { normalizeSiteUrl, blockPrivateHos
   }
 
   // 1) the AI picks the most relevant, distinct stories
-  log.action(`AI (${model}) is picking the ${task.count} most relevant articles`);
+  log.action(`Picking the ${task.count} most relevant articles`);
   const picked = await askJson(
     model,
     'You pick news articles for a reader. Choose the most relevant articles for the topic, newest first, each about a different story, preferring real news reports from known outlets over product listings, buying guides or ads. Reply with JSON: {"picked": [the article numbers, best first]}.',

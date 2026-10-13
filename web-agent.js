@@ -109,7 +109,7 @@ async function runWebAgent(page, task, log, helpers, preset = null) {
     normalizeSiteUrl,
   });
 
-  log.action(`AI agent (${WEB.model}) is working on the task, up to ${task.maxSteps} steps`);
+  log.action(`The agent is working on the task, up to ${task.maxSteps} steps`);
   let out = await runAgent(agent, 'Do the task now.', { maxTurns: task.maxSteps * 2 + 10, log, browser, label: 'The AI agent' });
   if (out.stopped === 'account' && !data.rows.length) throw new AgentError('AI_UNAVAILABLE', out.message);
   let usage = out.usage;
