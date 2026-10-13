@@ -24,7 +24,7 @@ const { openParallelPage, createLogger, normalizeSiteUrl, blockPrivateHosts, Age
 const { runHistory } = require('./db');
 
 const LIMITS = {
-  lanesPerUser: 3, // tasks running at the same time per user
+  lanesPerUser: 3, // lanes per user, working or finished (a finished one is closed to make room)
   // super agent tabs running at the same time on this server (each is about one browser's CPU)
   maxPages: Math.max(1, parseInt(process.env.SUPER_MAX_PAGES, 10) || CONFIG.maxBrowsers),
   stepsPerTurn: Math.min(60, Math.max(10, parseInt(process.env.SUPER_MAX_STEPS, 10) || 40)),
@@ -173,11 +173,16 @@ function checkMessage(message) {
   return m;
 }
 
-function checkRoom(userId, except) {
-  const active = [...userLanes(userId).values()].filter((l) => l !== except && isActive(l)).length;
-  if (active >= LIMITS.lanesPerUser) {
-    throw new AgentError('LANE_LIMIT', `${LIMITS.lanesPerUser} tasks are already running. Wait for one to finish or stop one, then send this again.`);
-  }
+/** A user has at most 3 lanes, working or finished: a finished one is closed to make room. */
+function checkRoom(userId) {
+  const lanes = [...userLanes(userId).values()];
+  if (lanes.length < LIMITS.lanesPerUser) return;
+  throw new AgentError(
+    'LANE_LIMIT',
+    lanes.every(isActive)
+      ? `All ${LIMITS.lanesPerUser} tasks are working. Wait for one to finish, close it (×), then send this.`
+      : `You can have ${LIMITS.lanesPerUser} tasks at a time. Close a finished one (×) to start a new one.`,
+  );
 }
 
 /** Drops the oldest finished lanes beyond the limit and lanes older than a day. */
@@ -383,8 +388,8 @@ function startLane(userId, input = {}) {
   const username = typeof input.username === 'string' ? input.username : '';
   const password = typeof input.password === 'string' ? input.password : '';
   if (username.length > 300 || password.length > 300) throw new AgentError('INVALID_TASK', 'The login details are too long.');
-  checkRoom(userId);
   prune(userId);
+  checkRoom(userId);
 
   const found = message.match(/https?:\/\/[^\s)"'<>]+|\b(?:[a-z0-9-]+\.)+(?:com|in|org|net|io|co|ai|app|dev|uk|us|info|biz|shop|store)(?:\/[^\s)"'<>]*)?/i);
   const url = found ? normalizeSiteUrl(found[0].replace(/[.,;:]+$/, '')) : null;
@@ -427,7 +432,6 @@ function followUp(userId, id, input = {}) {
   const lane = laneOf(userId, id);
   const message = checkMessage(input.message);
   if (isActive(lane)) throw new AgentError('LANE_BUSY', 'This task is still working. Wait for it to finish, or stop it first.');
-  checkRoom(userId, lane);
   lane.abort = new AbortController();
   const turn = newTurn(lane, message);
   runTurn(lane, turn).catch((err) => console.error('[super] lane failed:', err));
@@ -443,7 +447,9 @@ function stopLane(userId, id) {
 
 /** Removes a finished lane from the page (its run stays on the Tasks page). */
 function clearLane(userId, id) {
-  const lane = laneOf(userId, id);
+  const lane = userLanes(userId).get(id);
+  // already gone (e.g. the server restarted, which empties the lanes): nothing left to clear
+  if (!lane) return { cleared: true, missing: true };
   if (isActive(lane)) throw new AgentError('LANE_BUSY', 'Stop this task before clearing it.');
   userLanes(userId).delete(id);
   return { cleared: true };
@@ -455,7 +461,7 @@ function listLanes(userId) {
   const lanes = [...userLanes(userId).values()].sort((a, b) => b.createdAt - a.createdAt);
   return {
     lanes: lanes.map(laneView),
-    limits: { lanesPerUser: LIMITS.lanesPerUser, active: lanes.filter(isActive).length, serverBusy: pagesInUse >= LIMITS.maxPages },
+    limits: { lanesPerUser: LIMITS.lanesPerUser, lanes: lanes.length, active: lanes.filter(isActive).length, serverBusy: pagesInUse >= LIMITS.maxPages },
   };
 }
 
