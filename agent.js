@@ -965,7 +965,7 @@ async function getContext(s, log) {
       await acquireBrowserSlot(s, log);
       try {
         fs.mkdirSync(s.profileDir, { recursive: true });
-        log.action(`Opening your browser (${CONFIG.headless ? 'headless' : 'headed'})`);
+        log.action('Opening your browser');
         const context = await chromium.launchPersistentContext(s.profileDir, launchOptions());
         context.setDefaultTimeout(CONFIG.actionTimeoutMs);
         // Closed by us (idle / shutdown) or crashed: free the slot, relaunch next time.

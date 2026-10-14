@@ -41,16 +41,17 @@ const WORKING_RULES = (site, hasLogin, allowOtherSites, canAsk = false) => `How 
 - After an action, call read_page again when you need to see the result.
 - Menus are often closed: links you need may sit behind a menu button (☰, "Menu", "More", or a button with no name, usually top-left). Click it, then read_page again.
 - If clicking a link fails, open its /url from read_page with open_page instead. Only open addresses that read_page showed or the user gave you: never guess or make up an address.
-- ${hasLogin ? 'If you need to log in, type {{USERNAME}} into the username / email field and {{PASSWORD}} into the password field, exactly like that. The real values are filled in for you; you never see them and must never ask for them.' : 'No login details were given. If the task needs a login, stop and say so in your answer.'}
+- ${hasLogin ? 'If you need to log in, type {{USERNAME}} into the username / email field and {{PASSWORD}} into the password field, exactly like that. The real values are filled in for you; you never see them and must never ask for them.' : 'No login details were given. If the task needs a login, do not log in: never type a username or password, not even a demo or test one shown on the page. Stop and say that login details are needed.'}
 - When the page has a table, use read_tables to read it exactly. Save the data the user asked for with save_data: one row per item, short clear column names, the values exactly as the page shows them. Never invent or guess values; leave a cell empty if the page doesn't show it. Whenever the task asks for data, a list, values or details, save them with save_data before you answer, even if it is a single value.
 - Use check_text to confirm a value before you report it.
 - Search, location, city and address boxes often open a suggestion list while you type. type_text lists the suggestions: choose the matching one with pick_suggestion, otherwise the site may say the field is empty. If a box wants a city and the task names a country or region, use real cities in it (e.g. for "USA": New York, Los Angeles, Chicago, Houston, Phoenix...).
 - Results often load a few seconds after a search. Never decide that there are no results while the page shows "Loading…", "Getting…", "Please wait" or a spinner: use wait, then read_page again. Only "0 results" on a fully loaded page means nothing was found.
 - For a task over several items (e.g. 10 cities, 5 products), do them one by one: search one, save its data with save_data, then the next. Keep going until all are done or steps run low.
 - When the task is done (or you are nearly out of steps), stop calling tools and answer in plain words: what you did, and the result (the main values, or a short summary of the data saved). If something stopped you, say exactly what.
+- Write the answer in the language the user wrote the task in (e.g. Hinglish for a Hinglish task). Keep it short; no closing offers like "Let me know if you need anything else".
 
 Decide for yourself:
-- ${canAsk ? 'Decide for yourself whenever you sensibly can. Ask the user only when you truly need something only they can give or decide: a one-time code, a choice between real options, or a yes before you send, submit, buy, book or delete anything. Then stop and ask one short, clear question; the user answers in the chat.' : 'You cannot ask the user anything during the task and nobody will answer. Never end with a question or "let me know". When something is unclear, pick the most sensible reading of the task and do it.'}
+- ${canAsk ? 'Decide for yourself whenever you sensibly can. Ask the user only when you truly need something only they can give or decide: a one-time code, a choice between real options, or a yes before you send, submit, buy, book or delete anything. Then call ask_user with one short, clear question and end your turn; the user answers in the chat. Never ask anything in your answer without ask_user.' : 'You cannot ask the user anything during the task and nobody will answer. Never end with a question or "let me know". When something is unclear, pick the most sensible reading of the task and do it.'}
 - When a way doesn't work, try another before giving up: a different field or button, the suggestion list, a menu, a simpler search term, another page of the site.
 
 Rules:
@@ -66,6 +67,14 @@ Before your final answer, check: the data the task asks for is saved with save_d
 // A task that asks for data back (vs. "log in and check the page works").
 const WANTS_DATA = /\b(data|list|table|give me|get me|extract|collect|details|names?|prices?|emails?|phones?|numbers?|values?|find)\b/i;
 const SAVE_NOW = 'You have not saved any data yet. If you found the data the task asks for, call save_data with it now (only values you saw on the page; you have a few steps). Then write your final answer: no questions, no "let me know".';
+
+/** Drops a closing offer ("Let me know if you need anything else.") from the end of an answer. */
+function tidyAnswer(text) {
+  const all = String(text || '').trim();
+  // whole sentences only (after . ! ? or a new line), at the very end
+  const tidy = all.replace(/(?:(?<=[.!?\n])\s*(?:let me know|feel free to|if you (?:need|want|would like)|would you like|do you want|is there anything else)[^.!?\n]*[.!?]*)+\s*$/i, '').trim();
+  return tidy || all;
+}
 
 /** Two runs' token usage added up. */
 function addUsage(a, b) {
@@ -93,7 +102,9 @@ async function runWebAgent(page, task, log, helpers, preset = null) {
   log.action(`Opening ${startUrl}`);
   const { response, slow } = await openUrl(page, startUrl);
   if (slow) log.warn('The site is very slow to load; continuing with what is shown');
-  log.info(`The site answered ${response ? response.status() : 'nothing'}${hasLogin ? '; login details are ready (hidden from the AI)' : ''}`);
+  const code = response ? response.status() : 0;
+  if (!code || code >= 400) log.warn(code ? `The site did not open properly (error ${code}); it may block automated browsers` : 'The site did not answer');
+  else log.info(`Page opened${hasLogin ? '; login details are ready (hidden from the AI)' : ''}`);
   if (preset && preset.prepare) await preset.prepare(page, log);
 
   const prompt = preset ? preset.instructions : INSTRUCTIONS(startUrl, task, hasLogin, task.allowOtherSites);
@@ -122,7 +133,7 @@ async function runWebAgent(page, task, log, helpers, preset = null) {
     if (again.result) out = again;
   }
   const stoppedEarly = out.result ? null : out.stopped; // 'steps', 'time' or the error
-  let answer = out.result ? scrub(String(out.result.finalOutput || '').trim()) : '';
+  let answer = out.result ? tidyAnswer(scrub(String(out.result.finalOutput || '').trim())) : '';
   const steps = browser.steps();
   if (!answer) {
     answer = data.rows.length
@@ -149,7 +160,7 @@ async function runWebAgent(page, task, log, helpers, preset = null) {
  * The web agent itself (also used by super-agent.js, one per turn): the browser tools on
  * `page` plus save_data. Returns { agent, browser, data, scrub }; data is the table save_data
  * fills, scrub(text) masks the login values.
- * opts: { name, prompt, startUrl, columns?, allowOtherSites, maxSteps, secrets, log, normalizeSiteUrl, extraTools? }
+ * opts: { name, prompt, startUrl, columns?, allowOtherSites, allowUrls?, maxSteps, secrets, log, normalizeSiteUrl, extraTools? }
  */
 function buildWebAgent(page, opts) {
   const { prompt, startUrl, log, normalizeSiteUrl } = opts;
@@ -161,7 +172,7 @@ function buildWebAgent(page, opts) {
   const browser = createBrowserTools(page, {
     startUrl,
     // addresses written in the task may be opened too
-    allowUrls: (prompt.match(/https?:\/\/[^\s)"'<>]+/g) || []).map((u) => u.replace(/[.,;:]+$/, '')),
+    allowUrls: [...(prompt.match(/https?:\/\/[^\s)"'<>]+/g) || []).map((u) => u.replace(/[.,;:]+$/, '')), ...(opts.allowUrls || [])],
     allowOtherSites: opts.allowOtherSites,
     maxSteps: opts.maxSteps,
     log,
@@ -213,4 +224,4 @@ function buildWebAgent(page, opts) {
   return { agent, browser, data, scrub };
 }
 
-module.exports = { runWebAgent, buildWebAgent, WORKING_RULES, WEB, addUsage };
+module.exports = { runWebAgent, buildWebAgent, WORKING_RULES, WEB, addUsage, tidyAnswer };

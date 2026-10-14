@@ -284,11 +284,40 @@ function createBrowserTools(page, opts) {
    * first: menus often hold a hidden copy of the same link, which can't be clicked.
    */
   const element = async (role, name, index) => {
-    const all = role === 'text' ? page.getByText(name, { exact: false }) : page.getByRole(role, { name, exact: false });
-    const visible = all.filter({ visible: true });
-    return (await visible.count()) > (index || 0) ? visible.nth(index || 0) : all.nth(index || 0);
+    const find = (exact) => (role === 'text' ? page.getByText(name, { exact }) : page.getByRole(role, { name, exact }));
+    // The exact name first: a partial match for "Cart" also finds every "Add to cart" button.
+    for (const exact of [true, false]) {
+      const all = find(exact);
+      const visible = all.filter({ visible: true });
+      if ((await visible.count()) > (index || 0)) return visible.nth(index || 0);
+      if ((await all.count()) > (index || 0)) return all.nth(index || 0);
+    }
+    return null;
   };
+  const NOT_FOUND = (role, name) =>
+    `Not found: there is no ${role} "${short(name, 60)}" on the page now (names change, e.g. "Cart, 1 item"). Call read_page and use a name exactly as it lists it.`;
   const fail = (err) => `Failed: ${short(String(err && err.message ? err.message : err).split('\n')[0], 200)}`;
+
+  // The same action failing again and again (or repeated with no effect) eats every step:
+  // after 2 failures or 3 repeats in a row on an unchanged page the model is told to stop and
+  // try another way. ("Next" clicked page after page is not a repeat: the page changes.)
+  const failures = new Map();
+  let lastAction = '';
+  let repeats = 0;
+  const guard = async (action) => {
+    const shown = await page.evaluate(() => (document.body ? document.body.innerText.length : 0)).catch(() => 0);
+    const key = `${action}|${page.url()}|${shown}`;
+    repeats = key === lastAction ? repeats + 1 : 1;
+    lastAction = key;
+    if ((failures.get(`${action}|${page.url()}`) || 0) >= 2) return 'Stop: this already failed twice. Do not try it again; use another way (another element, open its /url with open_page) or finish and say what blocked you.';
+    if (repeats > 3) return 'Stop: you did exactly this 3 times in a row and it is not getting you anywhere. Call read_page, then try another way or finish and say what blocked you.';
+    return null;
+  };
+  const failed = (action, message) => {
+    const key = `${action}|${page.url()}`;
+    failures.set(key, (failures.get(key) || 0) + 1);
+    return message;
+  };
 
   // One browser, one action at a time: if the model asks for two actions at once (e.g. typing
   // two todos), they run one after the other instead of typing into the same box together.
@@ -355,12 +384,29 @@ function createBrowserTools(page, opts) {
       parameters: z.object({ role: z.string(), name: z.string(), index: z.number().int().nullable() }),
       execute: oneAtATime(async ({ role, name, index }) => {
         if (outOfSteps()) return LIMIT;
+        const key = `click|${role}|${name}|${index || 0}`;
+        const stop = await guard(key);
+        if (stop) return stop;
+        // Several elements with this exact name (e.g. an "Add to cart" under every product):
+        // clicking the first one may act on the wrong item, so the model must say which one.
+        if (index == null && role !== 'text') {
+          const same = page.getByRole(role, { name, exact: true }).filter({ visible: true });
+          const count = await same.count().catch(() => 0);
+          if (count > 1) {
+            const hrefs = role === 'link' ? await same.evaluateAll((els) => els.map((e) => e.getAttribute('href'))).catch(() => []) : [];
+            if (!hrefs.length || new Set(hrefs).size > 1) {
+              return `There are ${count} ${role}s named "${short(name, 60)}" on the page. Call click again with index = which one you mean, counting from 0 in the order read_page lists them (e.g. the one in the item you want).`;
+            }
+          }
+        }
         step(`Clicking ${role} "${short(name, 60)}"`);
         try {
-          await (await element(role, name, index)).click({ timeout: 8000 });
+          const target = await element(role, name, index);
+          if (!target) return failed(key, NOT_FOUND(role, name));
+          await target.click({ timeout: 8000 });
           return `Clicked. ${await after()}`;
         } catch (err) {
-          return fail(err);
+          return failed(key, fail(err));
         }
       }),
     }),
@@ -371,10 +417,23 @@ function createBrowserTools(page, opts) {
       execute: oneAtATime(async ({ role, name, text, submit, index }) => {
         if (outOfSteps()) return LIMIT;
         const secret = usesSecret(text);
-        // the log shows the placeholder, never the real value
-        step(`Typing ${secret ? text : `"${short(text, 40)}"`} into ${role} "${short(name, 50)}"${submit ? ' and pressing Enter' : ''}`);
+        const key = `type|${role}|${name}|${index || 0}|${text}`;
+        const stop = await guard(key);
+        if (stop) return stop;
         try {
           const field = await element(role, name, index);
+          if (!field) {
+            step(`Typing into ${role} "${short(name, 50)}"`);
+            return failed(key, NOT_FOUND(role, name));
+          }
+          // A password nobody gave (e.g. a demo one printed on the page) is never typed: the user
+          // decides which account the agent uses, through the login details.
+          if (!secrets.PASSWORD && (await field.getAttribute('type', { timeout: 2000 }).catch(() => '')) === 'password') {
+            step('Stopped at the password field: no login details were given');
+            return 'Not allowed: no login details were given for this task, so do not type any password (not even one shown on the page). Stop and tell the user to add login details and send the task again.';
+          }
+          // the log shows the placeholder, never the real value
+          step(`Typing ${secret ? text : `"${short(text, 40)}"`} into ${role} "${short(name, 50)}"${submit ? ' and pressing Enter' : ''}`);
           const value = withSecrets(text);
           const keyByKey = !secret && (/combobox|searchbox/i.test(role) || (await looksLikeAutocomplete(field)));
           if (keyByKey) {
@@ -397,7 +456,7 @@ function createBrowserTools(page, opts) {
           }
           return `Typed${filled ? '' : ' (but the field does not show the text: try another field or way)'}. ${await after()}`;
         } catch (err) {
-          return fail(err);
+          return failed(key, fail(err));
         }
       }),
     }),

@@ -16,9 +16,11 @@
  */
 
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { z } = require('zod');
 const { tool } = require('@openai/agents');
-const { buildWebAgent, WORKING_RULES, WEB, addUsage } = require('./web-agent');
+const { buildWebAgent, WORKING_RULES, WEB, addUsage, tidyAnswer } = require('./web-agent');
 const { useOpenAI, runAgent, openUrl, findSources, aiModel, short, sleep, usageOf } = require('./ai-browser');
 const { openParallelPage, createLogger, normalizeSiteUrl, blockPrivateHosts, AgentError, CONFIG } = require('./agent');
 const { runHistory } = require('./db');
@@ -33,7 +35,32 @@ const LIMITS = {
   keepLanes: 12, // lanes kept per user (oldest finished ones are dropped)
   laneTtlMs: 24 * 60 * 60 * 1000,
   messageChars: 3000,
+  shotsDays: 30, // saved screenshots (Tasks page) are kept this long
 };
+
+/** Screenshots are also saved here (data/super-shots/<runId>/<shot>.jpg) for the Tasks page. */
+const SHOTS_DIR = path.resolve(process.env.SUPER_SHOTS_DIR || './data/super-shots');
+const SHOT_ID = /^\d{1,3}-\d{1,3}$/;
+const RUN_ID = /^[0-9a-f-]{36}$/i;
+
+/** When this server process started: the page sees a restart (which ends all working lanes). */
+const SERVER_STARTED = new Date().toISOString();
+
+/** Old saved screenshots are removed (once at start, then daily). */
+function pruneShots() {
+  fs.readdir(SHOTS_DIR, { withFileTypes: true }, (err, dirs) => {
+    if (err) return;
+    const old = Date.now() - LIMITS.shotsDays * 86400000;
+    dirs.filter((d) => d.isDirectory()).forEach((d) => {
+      const dir = path.join(SHOTS_DIR, d.name);
+      fs.stat(dir, (e, st) => {
+        if (!e && st.mtimeMs < old) fs.rm(dir, { recursive: true, force: true }, () => {});
+      });
+    });
+  });
+}
+pruneShots();
+setInterval(pruneShots, 86400000).unref();
 
 /** userId -> Map(laneId -> lane) */
 const lanesByUser = new Map();
@@ -65,16 +92,24 @@ const CARRY_ON = "Don't describe what you will do: do it now with the tools and 
 
 // ---------------------------------------------------------------- the agent's prompt
 
-const PROMPT = (lane, site, hasLogin, allowOtherSites) => `You are the user's Super Agent: an assistant that does tasks for them in a real web browser.
+const PROMPT = (lane, site, hasLogin, allowOtherSites) => {
+  const others = lane.sites.slice(1);
+  const where = !site
+    ? 'No website was given: start with search_web to find the right pages, then open one with open_page (only addresses search_web or read_page gave you).'
+    : others.length
+      ? `The task is on several websites: ${lane.sites.join(', ')}. ${site} is already open; when you are done there, open the next one with open_page (e.g. ${others[0]}), and use search_web if you cannot find a page on it.`
+      : `The work is on ${site}: the start page is already open.`;
+  return `You are the user's Super Agent: an assistant that does tasks for them in a real web browser.
 The user gives a task in plain words and may send follow-up messages later in the same chat about the same work; do what the latest message asks.
 Every tool call is one step; you have at most ${LIMITS.stepsPerTurn} steps per message, so plan.
 
 The user's task:
 ${lane.task}
 
-${site ? `The work is on ${site}: the start page is already open.` : 'No website was given: start with search_web to find the right pages, then open one with open_page (only addresses search_web or read_page gave you).'}
+${where}
 
 ${WORKING_RULES(site || 'the websites you find', hasLogin, allowOtherSites, true)}`;
+};
 
 /** search_web: web pages for a query (OpenAI web search), which open_page may then open. */
 function searchTool(browser, log) {
@@ -93,6 +128,20 @@ function searchTool(browser, log) {
       } catch (err) {
         return `Search failed: ${short(err.message, 150)}`;
       }
+    }),
+  });
+}
+
+/** ask_user: the only way a turn ends waiting for the user's reply. */
+function askTool(browser, log, turn) {
+  return tool({
+    name: 'ask_user',
+    description: 'Ask the user one short question (a one-time code, a choice only they can make, or a yes before you send, submit, buy, book or delete). After this, end your turn with the same question as your answer.',
+    parameters: z.object({ question: z.string() }),
+    execute: browser.oneAtATime(async ({ question }) => {
+      turn.asked = short(question, 300);
+      log.info(`Asked you: ${turn.asked}`);
+      return 'Question sent. Now end your turn: write the question as your answer and call no more tools.';
     }),
   });
 }
@@ -121,6 +170,10 @@ async function shoot(lane, turn, page, label, { final = false } = {}) {
   if (!data) return;
   const id = `${turn.n}-${turn.shots.length + 1}`;
   lane.shots.set(id, data);
+  fs.promises
+    .mkdir(path.join(SHOTS_DIR, lane.runId), { recursive: true })
+    .then(() => fs.promises.writeFile(path.join(SHOTS_DIR, lane.runId, `${id}.jpg`), Buffer.from(data, 'base64')))
+    .catch((err) => console.error('[super] Could not save a screenshot:', err.message));
   turn.shots.push({ id, label: short(label, 80), url: page.url(), at: new Date().toISOString(), final });
   touch(lane);
 }
@@ -143,8 +196,8 @@ function laneView(lane) {
   return {
     id: lane.id,
     title: lane.title,
-    status: lane.status, // queued | running | waiting (asked a question) | done | stopped | failed
-    site: lane.url ? new URL(lane.url).hostname.replace(/^www\./, '') : '',
+    status: lane.status, // queued | running | waiting (asked a question) | done | incomplete (ran out of steps / time) | stopped | failed
+    site: lane.sites.map((u) => new URL(u).hostname.replace(/^www\./, '')).join(', '),
     hasLogin: lane.hasLogin,
     thinking: lane.thinking || '',
     runId: lane.runId,
@@ -224,16 +277,17 @@ function saveRun(lane, { first = false } = {}) {
     source: 'prompt',
     prompt: lane.task,
     task: { type: 'super_task', title: lane.title, url: lane.url || undefined, instructions: lane.task, hasLogin: lane.hasLogin, messages: lane.turns.length },
-    status: isActive(lane) ? 'running' : lane.status === 'failed' ? 'error' : 'success',
+    status: isActive(lane) ? 'running' : lane.status === 'failed' || lane.status === 'incomplete' ? 'error' : 'success',
     createdAt: lane.createdAt,
     logs: lane.turns.flatMap((t) => t.steps.map((s, i) => ({ step: t.n * 1000 + i + 1, time: s.at, level: s.level, message: s.text }))),
     report: isActive(lane)
       ? null
       : {
-          success: lane.status !== 'failed',
+          success: lane.status !== 'failed' && lane.status !== 'incomplete',
           durationMs: (last.finishedAt || Date.now()) - lane.createdAt,
-          result: { kind: 'super_task', url: lane.url || last.finalUrl || '', answer: last.answer || '', data: { columns, rows: rows.map((r) => r.slice(0, columns.length)) }, steps: lane.turns.reduce((n, t) => n + t.steps.length, 0), finalUrl: last.finalUrl, usedLogin: lane.hasLogin, usage: usageOf(usage, WEB.model) },
+          result: { kind: 'super_task', url: lane.url || last.finalUrl || '', answer: last.answer || '', data: { columns, rows: rows.map((r) => r.slice(0, columns.length)) }, steps: lane.turns.reduce((n, t) => n + t.steps.length, 0), finalUrl: last.finalUrl, usedLogin: lane.hasLogin, usage: usageOf(usage, WEB.model), shots: lane.turns.flatMap((t) => t.shots.map((sh) => ({ id: sh.id, label: sh.label, at: sh.at, message: t.n }))) },
           ...(lane.status === 'failed' ? { error: { code: 'SUPER_FAILED', message: last.error || 'The task failed.' } } : {}),
+          ...(lane.status === 'incomplete' ? { error: { code: 'SUPER_INCOMPLETE', message: last.answer || 'The agent could not finish the task.' } } : {}),
         },
   };
   try {
@@ -293,27 +347,30 @@ async function runTurn(lane, turn) {
       log.action(`Opening ${startUrl}`);
       const { response, slow } = await openUrl(page, startUrl);
       if (slow) log.warn('The site is very slow to load; continuing with what is shown');
-      log.info(`The site answered ${response ? response.status() : 'nothing'}${lane.hasLogin && turn.n === 1 ? '; login details are ready (hidden from the AI)' : ''}`);
+      const code = response ? response.status() : 0;
+      if (!code || code >= 400) log.warn(code ? `The site did not open properly (error ${code}); it may block automated browsers` : 'The site did not answer');
+      else log.info(`Page opened${lane.hasLogin && turn.n === 1 ? '; login details are ready (hidden from the AI)' : ''}`);
       await sleep(1200);
       await shoot(lane, turn, page, 'Start');
     }
 
     const site = lane.url ? new URL(lane.url).hostname : '';
-    const allowOtherSites = !lane.url || lane.allowOtherSites;
+    const allowOtherSites = !lane.url || lane.allowOtherSites || lane.sites.length > 1;
     const { agent, browser, data, scrub } = buildWebAgent(page, {
       name: 'Super agent',
       prompt: PROMPT(lane, site, lane.hasLogin, allowOtherSites),
       startUrl: startUrl || 'about:blank',
       allowOtherSites,
+      allowUrls: lane.sites,
       maxSteps: LIMITS.stepsPerTurn,
       secrets: lane.secrets,
       log,
       normalizeSiteUrl,
-      extraTools: (b) => [searchTool(b, log)],
+      extraTools: (b) => [searchTool(b, log), askTool(b, log, turn)],
     });
     // the earlier messages (and what the agent did) carry over, so follow-ups continue the work
     const input = lane.history ? [...lane.history, { role: 'user', content: turn.message }] : turn.n === 1 ? 'Do the task now.' : turn.message;
-    if (turn.n === 1) log.action(`Super Agent is working on it, up to ${LIMITS.stepsPerTurn} steps`);
+    log.action(turn.n === 1 ? 'Super Agent is working on it' : 'Working on your message');
     let out = await runAgent(agent, input, { maxTurns: LIMITS.stepsPerTurn * 2 + 10, log, browser, label: 'The agent', signal: lane.abort.signal });
     if (out.stopped === 'account') throw new AgentError('AI_UNAVAILABLE', out.message);
     let usage = out.usage;
@@ -321,8 +378,10 @@ async function runTurn(lane, turn) {
     // save the 10 cheapest…") without doing it: tell it to carry on (at most twice).
     for (let nudge = 0; nudge < 2 && out.result && !data.rows.length && !lane.abort.signal.aborted; nudge++) {
       const said = String(out.result.finalOutput || '');
-      const promise = /\b(I will|I'll|I am going to|I'm going to|Let me|Next,? I|Now,? I will|I need to)\b/i.test(said) && !/\?\s*$/.test(said);
-      if (!promise || browser.outOfSteps()) break;
+      const promise = /\b(I will|I'll|I am going to|I'm going to|Let me (now )?(open|go|click|check|search|find|collect|save|read|sort|look)|Next,? I|Now,? I will|I need to)\b/i.test(said) && !/\?\s*$/.test(said);
+      // "I could not open it: the site blocks automated browsers. I will need…" is an answer, not a promise
+      const blocked = /\b(can'?not|can't|couldn'?t|could not|unable|not able|blocked|captcha|access denied|login details|not allowed|no (results|data))\b/i.test(said);
+      if (!promise || blocked || turn.asked || browser.outOfSteps()) break;
       log.info('Continuing: the agent said what it would do next but stopped');
       const again = await runAgent(agent, [...out.result.history, { role: 'user', content: CARRY_ON }], { maxTurns: LIMITS.stepsPerTurn * 2 + 10, log, browser, label: 'The agent', signal: lane.abort.signal });
       usage = addUsage(usage, again.usage);
@@ -337,21 +396,31 @@ async function runTurn(lane, turn) {
     turn.finalUrl = lane.lastUrl;
     turn.data = data;
     turn.usage = usageOf(usage, WEB.model);
-    turn.answer = out.result ? scrub(String(out.result.finalOutput || '').trim()) : '';
+    const said = out.result ? scrub(String(out.result.finalOutput || '').trim()) : '';
+    // a question asked with ask_user stays as it is; otherwise no closing offers
+    turn.answer = turn.asked ? said : tidyAnswer(said);
     if (out.stopped === 'user') {
       turn.status = 'stopped';
       if (!turn.answer) turn.answer = data.rows.length ? `Stopped. ${data.rows.length} row(s) were saved before that.` : 'Stopped.';
     } else {
+      const cutOff = !out.result; // ran out of steps or time (or the AI failed) before answering
       if (!turn.answer) {
-        turn.answer = data.rows.length ? `Collected ${data.rows.length} row(s) before stopping.` : 'The agent stopped before finishing. Send a follow-up to continue.';
+        turn.answer = data.rows.length ? `Collected ${data.rows.length} row(s) before stopping.` : 'The agent could not finish this.';
         if (out.stopped === 'time') turn.answer += ' It reached the time limit.';
         else if (out.stopped === 'steps') turn.answer += ' It used all its steps for this message.';
+        turn.answer += ' Send a follow-up to continue, or give it a clearer way to do it.';
       }
-      // a question for the user (and nothing saved) ends the turn waiting for their reply; a
-      // finished task that only offers more ("Want me to …?") is done
-      turn.status = /\?\s*$/.test(turn.answer) && !data.rows.length ? 'waiting' : 'done';
+      // Only ask_user makes the turn wait for a reply; a finished task that offers more
+      // ("Want me to …?") is done, and one cut off with nothing saved is incomplete.
+      turn.status = turn.asked ? 'waiting' : cutOff && !data.rows.length ? 'incomplete' : 'done';
     }
-    log.success(`Done in ${browser.steps()} steps${data.rows.length ? `: ${data.rows.length} row(s) of data` : ''}`);
+    const n = browser.steps();
+    const what = data.rows.length ? `${data.rows.length} row(s) of data` : '';
+    if (turn.status === 'stopped') {
+      // the stop is already in the log
+    } else if (turn.status === 'incomplete') log.warn('Could not finish this');
+    else if (turn.status === 'waiting') log.info('Waiting for your reply');
+    else log.success(n ? `Done in ${n} step${n === 1 ? '' : 's'}${what ? `: ${what}` : ''}` : `Done${what ? `: ${what}` : ''}`);
     await shoot(lane, turn, page, 'End', { final: true });
   } catch (err) {
     turn.status = 'failed';
@@ -391,8 +460,14 @@ function startLane(userId, input = {}) {
   prune(userId);
   checkRoom(userId);
 
-  const found = message.match(/https?:\/\/[^\s)"'<>]+|\b(?:[a-z0-9-]+\.)+(?:com|in|org|net|io|co|ai|app|dev|uk|us|info|biz|shop|store)(?:\/[^\s)"'<>]*)?/i);
-  const url = found ? normalizeSiteUrl(found[0].replace(/[.,;:]+$/, '')) : null;
+  // Every web address in the message: the first is where it starts, the others may be opened
+  // too ("compare the price on hubspot.com with pipedrive.com").
+  const sites = [];
+  (message.match(/https?:\/\/[^\s)"'<>]+|\b(?:[a-z0-9-]+\.)+(?:com|in|org|net|io|co|ai|app|dev|uk|us|info|biz|shop|store)(?:\/[^\s)"'<>]*)?/gi) || []).forEach((m) => {
+    const u = normalizeSiteUrl(m.replace(/[.,;:]+$/, ''));
+    if (u && sites.length < 5 && !sites.some((x) => new URL(x).hostname === new URL(u).hostname)) sites.push(u);
+  });
+  const url = sites[0] || null;
   const now = Date.now();
   const lane = {
     id: crypto.randomUUID(),
@@ -401,6 +476,7 @@ function startLane(userId, input = {}) {
     title: titleOf(message),
     task: message,
     url: url || '',
+    sites,
     allowOtherSites: input.allowOtherSites === true,
     hasLogin: Boolean(username || password),
     status: 'queued',
@@ -462,6 +538,7 @@ function listLanes(userId) {
   return {
     lanes: lanes.map(laneView),
     limits: { lanesPerUser: LIMITS.lanesPerUser, lanes: lanes.length, active: lanes.filter(isActive).length, serverBusy: pagesInUse >= LIMITS.maxPages },
+    serverStarted: SERVER_STARTED,
   };
 }
 
@@ -472,4 +549,14 @@ function getShot(userId, id, shotId) {
   return { id: shotId, data };
 }
 
-module.exports = { startLane, followUp, stopLane, clearLane, listLanes, getShot, LIMITS };
+/** A saved screenshot of a run (the caller has checked the run is the user's). */
+function runShot(runId, shotId) {
+  if (!RUN_ID.test(runId) || !SHOT_ID.test(shotId)) throw new AgentError('SHOT_NOT_FOUND', 'This screenshot is no longer here.');
+  try {
+    return { id: shotId, data: fs.readFileSync(path.join(SHOTS_DIR, runId, `${shotId}.jpg`)).toString('base64') };
+  } catch {
+    throw new AgentError('SHOT_NOT_FOUND', 'This screenshot is no longer here.');
+  }
+}
+
+module.exports = { startLane, followUp, stopLane, clearLane, listLanes, getShot, runShot, LIMITS };

@@ -875,6 +875,15 @@ app.get(
   })
 );
 
+/** A saved Super Agent screenshot of one of the user's runs (Tasks page). */
+app.get(
+  '/api/agent/runs/:id/shots/:shot',
+  route(async (req, res) => {
+    if (!findRun(req, res)) return;
+    res.json({ success: true, shot: superAgent.runShot(req.params.id, req.params.shot) });
+  })
+);
+
 // ---------------------------------------------------------------------------
 // Fallbacks
 // ---------------------------------------------------------------------------

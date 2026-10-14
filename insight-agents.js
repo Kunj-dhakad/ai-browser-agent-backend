@@ -217,7 +217,11 @@ async function dataCollection(page, task, log, { normalizeSiteUrl, blockPrivateH
   log.action(`Opening ${task.url}`);
   const { response, slow } = await openUrl(page, task.url);
   if (slow) log.warn('The site is slow to load; reading what is shown');
-  log.info(`The site answered ${response ? response.status() : 'nothing'}`);
+  {
+    const code = response ? response.status() : 0;
+    if (!code || code >= 400) log.warn(code ? `The site did not open properly (error ${code}); it may block automated browsers` : 'The site did not answer');
+    else log.info('Page opened');
+  }
 
   let pages = 0;
   for (; pages < task.maxPages; ) {
