@@ -18,9 +18,9 @@
  *   GET    /api/admin/users         All users, with Gmail status and today's usage.
  *   POST   /api/admin/users         { email, name, password, role?, dailyEmailLimit? }
  *   PATCH  /api/admin/users/:id     { name?, role?, disabled?, password?, dailyEmailLimit? }
- *   DELETE /api/admin/users/:id     Removes the user, their browser profile and schedules.
+ *   DELETE /api/admin/users/:id     Removes the user and their browser profile.
  *
- *   Agent (the signed-in user's own browser, Gmail, runs and schedules)
+ *   Agent (the signed-in user's own browser, Gmail and runs)
  *   POST /api/agent/plan            { prompt } -> AI plan: the task, with the email written for you.
  *   POST /api/agent/parse           Rule-based interpretation of a prompt (no browser).
  *   POST /api/agent/run             Run a command, respond once with all logs (JSON).
@@ -38,9 +38,6 @@
  *   GET  /api/agent/stats           Dashboard numbers: today's usage + limit, task results today / 30 days.
  *   GET  /api/agent/runs/:id        One run with its logs and report.
  *   GET  /api/agent/runs/:id/stream SSE: past logs, then live logs, then the result.
- *   GET  /api/agent/schedules       The user's schedules.
- *   POST /api/agent/schedules       { task, prompt?, frequency: once|daily|weekly, time: "HH:MM", date?, weekday? }
- *   DELETE /api/agent/schedules/:id Remove one of the user's schedules.
  * ---------------------------------------------------------------------------
  */
 
@@ -69,7 +66,6 @@ const {
   CONFIG,
 } = require('./agent');
 const { planTask, createSummarizer, aiStatus } = require('./planner');
-const { startScheduler, stopScheduler, createSchedule, listSchedules, deleteSchedule, deleteUserSchedules } = require('./scheduler');
 const { users, usage, runHistory, publicUser } = require('./db');
 const superAgent = require('./super-agent');
 const auth = require('./auth');
@@ -135,7 +131,6 @@ function statusForError(code) {
   switch (code) {
     case 'INVALID_PROMPT':
     case 'INVALID_TASK':
-    case 'INVALID_SCHEDULE':
     case 'INVALID_INPUT':
     case 'INVALID_USER':
     case 'NEEDS_INFO':
@@ -148,7 +143,6 @@ function statusForError(code) {
       return 403;
     case 'NOT_FOUND':
     case 'RUN_NOT_FOUND':
-    case 'SCHEDULE_NOT_FOUND':
     case 'USER_NOT_FOUND':
     case 'LANE_NOT_FOUND':
     case 'SHOT_NOT_FOUND':
@@ -403,7 +397,6 @@ app.delete(
     if (!target) fail('USER_NOT_FOUND', 'This user no longer exists.');
     if (target.id === req.user.id) fail('INVALID_USER', 'You cannot delete your own account.');
     await removeUserData(target.id); // closes their browser, deletes their Gmail profile
-    deleteUserSchedules(target.id);
     for (const [id, run] of runs) if (run.userId === target.id) runs.delete(id);
     users.remove(target.id);
     res.json({ success: true });
@@ -603,7 +596,7 @@ function runSummary(run) {
     id: run.id,
     source: run.source, // "form" | "prompt"
     prompt: run.prompt,
-    scheduled: run.scheduled || undefined, // started by the scheduler
+    scheduled: run.scheduled || undefined, // started by the (removed) scheduler: older runs only
     task: run.task,
     status: run.status, // "running" | "success" | "error"
     createdAt: new Date(run.createdAt).toISOString(),
@@ -632,7 +625,7 @@ function pruneRuns() {
  * Starts a run of an already validated task for a user, in the background, and returns it
  * immediately. Throws DAILY_LIMIT when the user may not send another email today.
  */
-function startRun({ userId, task, prompt, dryRun, scheduled = false }) {
+function startRun({ userId, task, prompt, dryRun }) {
   const user = users.get(userId);
   if (!user || user.disabled) fail('UNAUTHENTICATED', 'Unknown or disabled user.');
   const effectiveTask = dryRun && task.type === 'send_email' ? { ...task, sendMode: 'draft' } : task;
@@ -641,7 +634,6 @@ function startRun({ userId, task, prompt, dryRun, scheduled = false }) {
   const run = {
     id: crypto.randomUUID(),
     userId,
-    scheduled,
     source: prompt ? 'prompt' : 'form',
     prompt, // the user's original words, kept for display and for the AI summary
     task: effectiveTask,
@@ -815,26 +807,6 @@ app.get('/api/agent/runs/:id/stream', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Schedules (the user's own)
-// ---------------------------------------------------------------------------
-
-app.get('/api/agent/schedules', (req, res) => {
-  res.json({ schedules: listSchedules(req.user.id) });
-});
-
-app.post(
-  '/api/agent/schedules',
-  route(async (req, res) => {
-    res.status(201).json({ success: true, schedule: createSchedule(req.body, req.user.id) });
-  })
-);
-
-app.delete('/api/agent/schedules/:id', (req, res) => {
-  if (deleteSchedule(req.params.id, req.user.id)) return res.json({ success: true });
-  res.status(404).json({ success: false, error: { code: 'SCHEDULE_NOT_FOUND', message: 'This schedule no longer exists.' } });
-});
-
-// ---------------------------------------------------------------------------
 // Super Agent (super-agent.js): up to 3 tasks at once per user, each a chat with follow-ups
 // ---------------------------------------------------------------------------
 
@@ -913,7 +885,6 @@ const server = app.listen(PORT, () => {
   console.log(`[server] Sign-in: ${AUTH_MODE === 'php' ? 'through the PHP app (AUTH_MODE=php)' : AUTH_MODE === 'both' ? 'local accounts and the PHP app' : 'local accounts'}`);
   if (AUTH_MODE !== 'php' && users.count() === 0) console.warn('[server] No users yet. Create the first admin: npm run add-admin');
   runHistory.recoverAfterRestart(); // tasks cut off by the last shutdown are marked as interrupted
-  startScheduler(startRun); // runs scheduled tasks when they're due
 });
 
 // SSE responses can legitimately stay open for minutes.
@@ -922,7 +893,6 @@ server.headersTimeout = 65000;
 
 async function shutdown(signal) {
   console.log(`[server] ${signal} received, shutting down...`);
-  stopScheduler();
   server.close();
   await closeBrowser();
   process.exit(0);

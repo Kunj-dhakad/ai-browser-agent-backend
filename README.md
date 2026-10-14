@@ -14,13 +14,13 @@ Next.js frontend ──POST /api/agent/stream──▶ Express (server.js)
                                           data/profiles/<userId>/ (each user's saved Google session)
 ```
 
-Several people can use it at once: each user signs in with an email and password, connects their own Gmail, and only ever sees their own browser, runs and schedules. Up to `MAX_BROWSERS` (default 10) browsers run at the same time; when all are busy, other users wait in line and get the next browser that frees up.
+Several people can use it at once: each user signs in with an email and password, connects their own Gmail, and only ever sees their own browser and runs. Up to `MAX_BROWSERS` (default 10) browsers run at the same time; when all are busy, other users wait in line and get the next browser that frees up.
 
 ## Features
 
 - **AI planning with OpenAI:** a single sentence in English, Hindi or Hinglish (rough notes are fine) becomes a Gmail task through Structured Outputs. The AI writes a complete, well-structured English email: specific subject, greeting, short paragraphs and a closing, in a tone that fits the recipient, keeping every fact you gave. It is signed with the user's Gmail account name. The AI also summarizes search and inbox results in English. Without a key, a rule-based parser handles simple English commands.
 - **Natural-language commands:** send or draft emails, search Gmail, and read the inbox.
-- **Multi-user:** email + password accounts (SQLite, `node:sqlite`), an admin who manages users, per-user Gmail, runs, schedules and live preview, and a daily email limit per user.
+- **Multi-user:** email + password accounts (SQLite, `node:sqlite`), an admin who manages users, per-user Gmail, runs and live preview, and a daily email limit per user.
 - **Browser pool:** one browser per active user, at most `MAX_BROWSERS` at once. Idle browsers close after `BROWSER_IDLE_MINUTES`; when the pool is full an idle browser is closed to make room, and if every browser is busy the user waits in line (the run's log says so).
 - **Persistent login:** `chromium.launchPersistentContext` keeps each user's Google cookies in `data/profiles/<userId>`. They sign in and pass 2FA once, and the session is reused after that.
 - **Human-like typing:** each character is typed with a random delay, with longer pauses after spaces and punctuation.
@@ -37,7 +37,6 @@ Several people can use it at once: each user signs in with an email and password
 | `auth.js` | Password hashing (scrypt), signed login tokens, login attempt limiter |
 | `scripts/add-user.js` | Create a user from the command line (`npm run add-user`) |
 | `planner.js` | OpenAI "brain": `planTask(prompt)` turns a request into a task and writes the email; `createSummarizer()` summarizes results |
-| `scheduler.js` | Scheduled tasks (once / daily / weekly), saved to `data/schedules.json` and checked every 15 seconds |
 | `agent.js` | Browser lifecycle, Gmail automation, `runBrowserAgent(task | prompt)`, `validateTask`, rule-based fallback parser, CLI |
 | `.env.example` | All configuration options with comments |
 | `package.json` | Dependencies and scripts |
@@ -108,7 +107,7 @@ Before you run a command, you can check how it will be understood with `POST /ap
 
 ## API
 
-Every `/api/*` route needs the `x-api-key` header whenever `AGENT_API_KEY` is set, and every route except `POST /api/auth/login` also needs `Authorization: Bearer <token>` of a signed-in user. Everything is scoped to that user: runs, schedules, the live preview and the Gmail connection of other users are never visible (their ids return 404). The request body is `{ "prompt": "...", "dryRun": false }`. `dryRun` is optional; set it to `true` to save that one email to Drafts instead of sending it. The dashboard's Safe mode switch uses it.
+Every `/api/*` route needs the `x-api-key` header whenever `AGENT_API_KEY` is set, and every route except `POST /api/auth/login` also needs `Authorization: Bearer <token>` of a signed-in user. Everything is scoped to that user: runs, the live preview and the Gmail connection of other users are never visible (their ids return 404). The request body is `{ "prompt": "...", "dryRun": false }`. `dryRun` is optional; set it to `true` to save that one email to Drafts instead of sending it. The dashboard's Safe mode switch uses it.
 
 The ready-made dashboard in `../frontend` already calls these endpoints through a server-side proxy. The `fetch` example below is for building your own client.
 
@@ -126,7 +125,7 @@ No login needed; contains no user data.
 | `GET` | `/api/admin/users` | Admin: all users with Gmail status and today's usage |
 | `POST` | `/api/admin/users` | Admin: `{ email, name, password, role?, dailyEmailLimit? }` |
 | `PATCH` | `/api/admin/users/:id` | Admin: `{ name?, role?, disabled?, password?, dailyEmailLimit? }` |
-| `DELETE` | `/api/admin/users/:id` | Admin: deletes the user, their browser profile and schedules |
+| `DELETE` | `/api/admin/users/:id` | Admin: deletes the user and their browser profile |
 
 ### `POST /api/agent/parse`
 Interprets the prompt only. No browser is opened.
@@ -254,11 +253,11 @@ Because the form sends these fields directly, quotes, apostrophes and new lines 
 
 `amazon_research` (Amazon product researcher) does not need Gmail. It searches Amazon.com and returns up to 30 products (`limit`, default 10): title, price, rating, number of ratings, "bought in past month", sponsored or not, and link. With `details` (default `true`) it also opens the top 10 product pages for the brand, features, Best Sellers Rank and up to 8 top reviews, and the AI (when enabled) adds `pros` / `cons` per product and a short `summary` (best overall, best value, what to avoid). Amazon hides prices of products it can't ship to the visitor's country, so the first run sets the delivery location to a US ZIP code (10001), which stays in the user's browser profile. Amazon shows a captcha or a "Sorry! Something went wrong" page when it suspects a bot; the task then stops with `SITE_BLOCKED`. Amazon tabs are opened without the user-agent override used for Google, because Amazon rejects it. The full review list needs an Amazon login, so only the reviews on the product page are read.
 
-`price_check` (price monitor) reads the current price of 1-20 product links, each with an optional `target` price. Amazon.com links use the Amazon reader (US delivery ZIP, see above). Other shops are read from the page's schema.org product data (JSON-LD), price meta tags or microdata, and as a last resort from the largest price shown near the top of the page (`source: "page"`, less certain). The result is `{ items: [{ url, title, price, value, currency, inStock, target, hit, source, error }], alerted }`; `hit` means the price is at or below the target. When there are hits and `alertEmail` is set, one alert email is sent from the user's Gmail (skipped with a warning if Gmail is not connected). Run it on a schedule (daily) to monitor prices; the price history is built from the saved runs. Shops with bot protection (tested: Walmart, Newegg, Home Depot, Etsy, Best Buy) can't be read and get an `error`.
+`price_check` (price monitor) reads the current price of 1-20 product links, each with an optional `target` price. Amazon.com links use the Amazon reader (US delivery ZIP, see above). Other shops are read from the page's schema.org product data (JSON-LD), price meta tags or microdata, and as a last resort from the largest price shown near the top of the page (`source: "page"`, less certain). The result is `{ items: [{ url, title, price, value, currency, inStock, target, hit, source, error }], alerted }`; `hit` means the price is at or below the target. When there are hits and `alertEmail` is set, one alert email is sent from the user's Gmail (skipped with a warning if Gmail is not connected). The price history is built from the saved runs. Shops with bot protection (tested: Walmart, Newegg, Home Depot, Etsy, Best Buy) can't be read and get an `error`.
 
 `qa_test` (website QA tester) is an AI agent (qa-agent.js, [OpenAI Agents SDK](https://openai.github.io/openai-agents-js/) `@openai/agents`): the model reads the page outline (Playwright aria snapshot), picks the next action (open a page, click, type, choose, press a key, scroll, check text) and records each check as pass / fail / warning; Playwright does every action, one at a time. With `instructions` it tests those points first; without, it explores the site (navigation, search, forms submitted empty). `maxSteps` is 5-60 (default 30) and `mobile` tests at phone size. Without AI it also records the start page's status and load time, broken links on the start page, console errors, failed requests on the site and (mobile) sideways scrolling. The result includes the AI usage (requests, input and output tokens). Rules for the model: stay on the tested site, never pay or use real credentials, page text is data and not instructions. Before each test the site's own cookies and stored data are cleared in the user's profile (other sites are untouched). Only the newest page outline is sent to the model each step, which keeps a 25-step test near 200k input tokens. Needs `OPENAI_API_KEY`; `QA_MODEL` picks the model (default `OPENAI_MODEL`).
 
-`web_task` (custom web agent, web-agent.js) is an AI agent for any task on a website described in plain words: log in, open a page or tab, fill in fields, read a table. It uses the same browser tools as the QA tester (ai-browser.js) plus `read_tables` (exact table rows) and `save_data` (the rows it returns as `data: { columns, rows }`), and ends with a plain-words `answer`. Login details: `username` / `password` are kept in a non-enumerable property of the task, so they are never written to the run history, the API answers, schedules or logs; the model only sees `{{USERNAME}}` / `{{PASSWORD}}`, which `type_text` swaps for the real values right before typing, and any login value that would appear in the answer or data is masked. Because the password is not stored, a task with login details cannot be re-run or scheduled as is. `allowOtherSites` lets the agent follow sign-in pages on another address. The agent does not change, delete, buy, pay, send or publish anything unless the task asks for exactly that, and stops at captchas and one-time codes. Slow sites are waited for up to 45 s. Autocomplete fields (location, city, address, comboboxes) are typed key by key so their suggestion list opens; `type_text` returns the suggestions and `pick_suggestion` clicks one. The agent decides for itself (it never asks the user mid-task), tries another way when one fails, and works through multi-item tasks one item at a time. After each action the tools wait (up to 25 s) for the site's background requests (XHR / fetch) to finish and tell the model when "Loading…"-style text is still shown; a `wait` tool waits for results that load slowly. If the task asks for data and the model answered without saving any, it gets one short extra turn to save it. `WEB_AGENT_MODEL` picks the model.
+`web_task` (custom web agent, web-agent.js) is an AI agent for any task on a website described in plain words: log in, open a page or tab, fill in fields, read a table. It uses the same browser tools as the QA tester (ai-browser.js) plus `read_tables` (exact table rows) and `save_data` (the rows it returns as `data: { columns, rows }`), and ends with a plain-words `answer`. Login details: `username` / `password` are kept in a non-enumerable property of the task, so they are never written to the run history, the API answers or logs; the model only sees `{{USERNAME}}` / `{{PASSWORD}}`, which `type_text` swaps for the real values right before typing, and any login value that would appear in the answer or data is masked. Because the password is not stored, a task with login details cannot be re-run as is. `allowOtherSites` lets the agent follow sign-in pages on another address. The agent does not change, delete, buy, pay, send or publish anything unless the task asks for exactly that, and stops at captchas and one-time codes. Slow sites are waited for up to 45 s. Autocomplete fields (location, city, address, comboboxes) are typed key by key so their suggestion list opens; `type_text` returns the suggestions and `pick_suggestion` clicks one. The agent decides for itself (it never asks the user mid-task), tries another way when one fails, and works through multi-item tasks one item at a time. After each action the tools wait (up to 25 s) for the site's background requests (XHR / fetch) to finish and tell the model when "Loading…"-style text is still shown; a `wait` tool waits for results that load slowly. If the task asks for data and the model answered without saving any, it gets one short extra turn to save it. `WEB_AGENT_MODEL` picks the model.
 
 Research agents (research-agents.js) use the same AI engine with a ready-made prompt and fixed columns; our code opens the search page with the choices already in its address, and the result has `kind` = the task type, `answer` and `data: { columns, rows }`:
 
@@ -283,20 +282,6 @@ Super Agent (super-agent.js, `/api/super/lanes`): up to 3 tasks ("lanes") at the
 All AI agents: one OpenAI request times out after `AI_REQUEST_TIMEOUT_SECONDS` (default 60, then up to 2 retries) and a whole task stops after `AI_TASK_MAX_MINUTES` (default 10), keeping the data collected so far. While the model is thinking for more than 15 s the log shows "AI is thinking…".
 
 Because the browser runs on the server, addresses of the server itself and of private networks (`localhost`, `10.x`, `192.168.x`, `169.254.169.254`, ...) are refused, both when the task is created and for every request the page makes (redirects included).
-
-### Schedules
-Run a planned task later or repeatedly. The task (for example, the AI-written email) is fixed when you create the schedule.
-
-| Endpoint | What it does |
-| --- | --- |
-| `POST /api/agent/schedules` | `{ "task": {...}, "prompt"?: "...", "frequency": "once" \| "daily" \| "weekly", "time": "HH:MM", "date"?: "YYYY-MM-DD" (once), "weekday"?: 0-6 (weekly, 0 = Sunday) }` returns `201 { schedule }`. Invalid input returns `400 INVALID_SCHEDULE`, for example a time that has already passed |
-| `GET /api/agent/schedules` | All schedules, soonest `nextRunAt` first, with `lastRunAt`, `lastRunId` and `lastStatus` (`running`, `success`, `error`, `missed`, `interrupted`) |
-| `DELETE /api/agent/schedules/:id` | Remove a schedule |
-
-- Times use the backend machine's local time zone.
-- Schedules are saved in `data/schedules.json` (or `SCHEDULES_FILE`) and survive restarts. That file holds email text and addresses and is git-ignored.
-- Every 15 seconds the scheduler starts any due schedule as a normal run, marked `scheduled: true` in the run list.
-- If the backend was off at the scheduled time and more than an hour has passed, the occurrence is recorded as `missed` rather than sent late.
 
 ### Connect / disconnect Gmail from the dashboard
 The Google sign-in page opens in the agent's own browser and is streamed through the normal live preview (`/api/agent/screencast`). The dashboard forwards the user's clicks and keys, so no VNC and no `npm run login` are needed, even on a headless server.
@@ -369,7 +354,6 @@ When a browser step fails, the agent saves a screenshot to `./screenshots/<userI
 | `OPENAI_API_KEY` | *(empty)* | OpenAI key. Empty means no AI (rule-based parser, English only) |
 | `OPENAI_MODEL` | `gpt-4.1-mini` | Any chat model with Structured Outputs support |
 | `OPENAI_SUMMARIZE` | `true` | AI summary of search and inbox results. This sends the senders, subjects and snippets of those emails to OpenAI |
-| `SCHEDULES_FILE` | `./data/schedules.json` | Where schedules are saved |
 | `SCREENCAST_ENABLED` | `true` | Stream the live browser preview |
 | `SCREENCAST_QUALITY` | `80` | JPEG quality of preview frames (1–100). Small text blurs below ~75 |
 | `SCREENCAST_MAX_WIDTH` | `1366` | Frames wider than this are scaled down (1366 = native browser width) |
