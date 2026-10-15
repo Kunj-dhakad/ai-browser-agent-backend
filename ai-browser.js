@@ -99,6 +99,84 @@ function usageOf(usage, model) {
     : { model };
 }
 
+// An open popup: Bootstrap / ARIA modals, <dialog>, and the like.
+const DIALOGS = '[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog[open], .modal.show, .modal.in, .swal2-popup';
+
+/**
+ * The page outline for the model, shorter: images without a name and empty links are left
+ * out (on card lists they are most of the text), and repeated blank lines go.
+ */
+function tidySnapshot(snapshot) {
+  return String(snapshot)
+    .split('\n')
+    .filter((l) => !/^\s*- img\s*$/.test(l) && !/^\s*- \/url: "?javascript:void\(0\);?"?\s*$/.test(l))
+    .join('\n');
+}
+
+/**
+ * Marks the clickable things on screen with numbers (1, 2, 3…) drawn on the page, for a
+ * screenshot: [{ n, x, y, label }] (x, y = the middle, in page pixels of the viewport).
+ */
+async function markClickables(page) {
+  // the page itself, then its frames (editors and widgets often live in an iframe), numbered on
+  const list = [];
+  for (const frame of page.frames().slice(0, 8)) {
+    let offset = { x: 0, y: 0 };
+    if (frame !== page.mainFrame()) {
+      const box = await frame.frameElement().then((el) => el.boundingBox()).catch(() => null);
+      if (!box || box.width < 50 || box.height < 50) continue;
+      offset = { x: box.x, y: box.y };
+    }
+    const found = await markFrame(frame, list.length, 80 - list.length);
+    found.forEach((m) => list.push({ ...m, x: Math.round(m.x + offset.x), y: Math.round(m.y + offset.y) }));
+    if (list.length >= 80) break;
+  }
+  return list;
+}
+
+/** Marks the clickable things of one frame, numbered from start + 1 (x, y within the frame). */
+async function markFrame(frame, start, limit) {
+  return frame
+    .evaluate(({ start, limit }) => {
+      document.querySelectorAll('[data-ba-mark]').forEach((e) => e.remove());
+      const sel = 'a, button, input:not([type=hidden]), select, textarea, summary, [role=button], [role=link], [role=tab], [role=menuitem], [role=option], [role=checkbox], [role=radio], [onclick], [data-bs-toggle], [data-toggle], [tabindex]:not([tabindex="-1"])';
+      const picked = [];
+      for (const el of document.querySelectorAll(sel)) {
+        const r = el.getBoundingClientRect();
+        if (r.width < 6 || r.height < 6 || r.bottom < 0 || r.right < 0 || r.top > innerHeight || r.left > innerWidth) continue;
+        const st = getComputedStyle(el);
+        if (st.visibility === 'hidden' || Number(st.opacity) === 0) continue;
+        const x = Math.min(innerWidth - 2, Math.max(1, r.left + r.width / 2));
+        const y = Math.min(innerHeight - 2, Math.max(1, r.top + r.height / 2));
+        const top = document.elementFromPoint(x, y);
+        if (!top || !(el === top || el.contains(top) || top.contains(el))) continue; // covered (e.g. by a popup)
+        if (picked.some((p) => p.el.contains(el))) continue; // one mark per clickable thing
+        const label = (el.getAttribute('aria-label') || el.innerText || el.value || el.placeholder || el.title || el.getAttribute('alt') || (el.querySelector('img') && el.querySelector('img').alt) || '').replace(/\s+/g, ' ').trim().slice(0, 70);
+        picked.push({ el, x: Math.round(x), y: Math.round(y), label, tag: (el.getAttribute('role') || el.tagName).toLowerCase() });
+        if (picked.length >= limit) break;
+      }
+      picked.forEach((m, i) => {
+        const d = document.createElement('div');
+        d.setAttribute('data-ba-mark', '');
+        d.textContent = String(start + i + 1);
+        d.style.cssText = `position:fixed;left:${Math.max(0, m.x - 9)}px;top:${Math.max(0, m.y - 9)}px;z-index:2147483647;background:#e11d48;color:#fff;font:bold 11px/14px Arial,sans-serif;padding:1px 4px;border-radius:4px;border:1px solid #fff;pointer-events:none`;
+        document.body.appendChild(d);
+      });
+      return picked.map((m, i) => ({ n: start + i + 1, x: m.x, y: m.y, label: m.label, tag: m.tag }));
+    }, { start, limit })
+    .catch(() => []);
+}
+
+/** The frames shown inside the page (iframes big enough to matter), without the page itself. */
+async function shownFrames(page) {
+  const out = [];
+  for (const frame of page.frames().slice(1, 8)) {
+    const box = await frame.frameElement().then((el) => el.boundingBox()).catch(() => null);
+    if (box && box.width >= 50 && box.height >= 50) out.push(frame);
+  }
+  return out;
+}
+
 /** A field that opens suggestions while you type (location, city, address search...). */
 async function looksLikeAutocomplete(field) {
   return field
@@ -284,7 +362,9 @@ function createBrowserTools(page, opts) {
   // search results this way, some slowly (measured: 13 s), and show "0 results" until then.
   // Requests to other sites (ads, analytics) are left out: on news sites they never stop.
   const pending = new Map();
+  let requestsSent = 0; // all requests so far: did an action start anything?
   const track = (r) => {
+    requestsSent++;
     if (['xhr', 'fetch'].includes(r.resourceType())) pending.set(r, Date.now());
   };
   const untrack = (r) => pending.delete(r);
@@ -312,17 +392,27 @@ function createBrowserTools(page, opts) {
   const loadingNote = async () => {
     const seen = await page
       .evaluate(() => {
-        const re = /\b(loading|getting|fetching|searching|please wait|processing)\b[^\n]{0,40}?(\.\.\.|…)|\bplease wait\b/i;
-        const m = (document.body.innerText || '').match(re);
-        return m ? m[0] : '';
+        // "Loading…", "Searching…", and the progress lines of AI generators ("Understanding your idea…").
+        // Words like "Building…" also start cut-off titles ("Building a smart school busine…"),
+        // so they count only when the page shows two or more such lines (a progress list).
+        const sure = /^\s*(loading|getting|fetching|searching|processing|generating|understanding|analy[sz]ing|uploading|rendering)\b.{0,40}?(\.\.\.?|…)\s*$|\bplease wait\b/i;
+        const maybe = /^\s*(creating|planning|building|crafting|writing|preparing|thinking)\b.{0,45}?(\.\.\.?|…)\s*$/i;
+        const lines = (document.body.innerText || '').split('\n');
+        const hit = lines.find((l) => sure.test(l));
+        if (hit) return hit.trim();
+        const some = lines.filter((l) => maybe.test(l));
+        return some.length >= 2 ? some[0].trim() : '';
       })
       .catch(() => '');
     return seen ? ` The page still shows "${short(seen, 60)}": it may still be loading results; use wait, then read_page again before you decide.` : '';
   };
 
+  const pageTextSize = () => page.evaluate(() => (document.body ? document.body.innerText.length : 0)).catch(() => 0);
+
   /** After an action: wait for the site to finish loading; back to the site if a click left it (unless other sites are allowed). */
   const after = async () => {
     await settle(page);
+    known.add(page.url().split('#')[0]); // the page it is on can always be opened again (a reload)
     if (!allowOtherSites && !sameSite(page.url(), baseHost)) {
       const left = page.url();
       await page.goBack({ timeout: 10000 }).catch(() => page.goto(startUrl).catch(() => {}));
@@ -337,16 +427,23 @@ function createBrowserTools(page, opts) {
    * first: menus often hold a hidden copy of the same link, which can't be clicked.
    */
   const element = async (role, name, index) => {
-    const find = (exact) => (role === 'text' ? page.getByText(name, { exact }) : page.getByRole(role, { name, exact }));
-    // The exact name first: a partial match for "Cart" also finds every "Add to cart" button.
-    for (const exact of [true, false]) {
-      const all = find(exact);
-      const visible = all.filter({ visible: true });
-      if ((await visible.count()) > (index || 0)) return visible.nth(index || 0);
-      if ((await all.count()) > (index || 0)) return all.nth(index || 0);
+    // the page first, then the frames inside it (editors and widgets often live in an iframe)
+    for (const scope of [page, ...(await shownFrames(page))]) {
+      const find = (exact) => (role === 'text' ? scope.getByText(name, { exact }) : scope.getByRole(role, { name, exact }));
+      // The exact name first: a partial match for "Cart" also finds every "Add to cart" button.
+      for (const exact of [true, false]) {
+        const all = find(exact);
+        const visible = all.filter({ visible: true });
+        if ((await visible.count()) > (index || 0)) return visible.nth(index || 0);
+        if (scope === page && (await all.count()) > (index || 0)) return all.nth(index || 0);
+      }
     }
     return null;
   };
+  // The numbered marks of the last look (click_mark uses them).
+  let marks = null;
+  // The page open_page was last warned about (it was still working when the model wanted to leave).
+  let leaveWarned = '';
   // After the password was typed and the form sent: the login form still there = it failed.
   let passwordTyped = false;
   const loginStillShown = async () => {
@@ -356,6 +453,8 @@ function createBrowserTools(page, opts) {
       ? ' NOTE: the login form is still shown, so the login probably failed. Read the page for an error (e.g. "invalid email or password"). Try logging in at most once more; if it fails again, stop and tell the user the login details did not work.'
       : '';
   };
+  const NOTHING_CHANGED =
+    ' NOTE: the click changed nothing (no new page, no request, same text). Do not click it again the same way: reload the page with open_page on the current address and try once more, or use look and click_mark, or another way (a menu, a link).';
   const NOT_FOUND = (role, name) =>
     `Not found: there is no ${role} "${short(name, 60)}" on the page now (names change, e.g. "Cart, 1 item"). Call read_page and use a name exactly as it lists it.`;
   const fail = (err) => `Failed: ${short(String(err && err.message ? err.message : err).split('\n')[0], 200)}`;
@@ -406,15 +505,80 @@ function createBrowserTools(page, opts) {
   const tools = [
     tool({
       name: 'read_page',
-      description: 'Read the current page: its address, title and an outline of its content and controls (role "name" per line).',
+      description: 'Read the current page: its address, title and an outline of its content and controls (role "name" per line). An open popup (dialog) is shown first. A long page comes in parts: part = 2, 3… reads further.',
+      parameters: z.object({ part: z.number().int().nullable() }),
+      execute: oneAtATime(async ({ part }) => {
+        if (outOfSteps()) return LIMIT;
+        const n = Math.max(1, Number(part) || 1);
+        step(n > 1 ? `Reading the page (part ${n})` : 'Reading the page');
+        let snapshot = tidySnapshot(await page.locator('body').ariaSnapshot({ timeout: 15000 }).catch((e) => `(could not read the page: ${e.message})`));
+        remember(snapshot);
+        // an open popup sits at the end of the page, where a long page gets cut: show it first
+        let popup = '';
+        const dialog = page.locator(DIALOGS).filter({ visible: true }).last();
+        if (n === 1 && (await dialog.count().catch(() => 0))) {
+          popup = tidySnapshot(await dialog.ariaSnapshot({ timeout: 8000 }).catch(() => ''));
+          remember(popup);
+        }
+        // what the iframes show (an editor, a form, a widget): their outline goes after the page's
+        let framed = '';
+        for (const frame of await shownFrames(page)) {
+          const inner = tidySnapshot(await frame.locator('body').ariaSnapshot({ timeout: 8000 }).catch(() => ''));
+          if (inner.trim()) {
+            remember(inner);
+            framed += `\n\nINSIDE AN IFRAME (${short(frame.url(), 80)}); click and type_text work here too:\n${inner}`;
+          }
+        }
+        if (framed) snapshot = snapshot + framed;
+        const parts = Math.max(1, Math.ceil(snapshot.length / SNAPSHOT_CHARS));
+        const body = snapshot.slice((n - 1) * SNAPSHOT_CHARS, n * SNAPSHOT_CHARS);
+        const note = await loadingNote();
+        return `URL: ${page.url()}\nTitle: ${await page.title()}${note ? `\nNote:${note}` : ''}` +
+          (popup ? `\n\nA POPUP IS OPEN over the page. Act on it first (or close it):\n${short(popup, 8000)}\n\nThe page behind it:` : '') +
+          `\n\n${body || '(no more content)'}` +
+          (parts > n ? `\n\n(Part ${n} of ${parts}: the page goes on. Call read_page with part=${n + 1} to read further, or use look to see the screen.)` : '');
+      }),
+    }),
+    tool({
+      name: 'look',
+      description: 'See the screen: a screenshot of what the page shows now, with a red number on every clickable thing, plus the list of those numbers. Use it when read_page is not enough: icons or cards without names, popups, editors, layouts, or to check what really happened after an action. Then click one with click_mark.',
       parameters: z.object({}),
       execute: oneAtATime(async () => {
         if (outOfSteps()) return LIMIT;
-        step('Reading the page');
-        const snapshot = await page.locator('body').ariaSnapshot({ timeout: 15000 }).catch((e) => `(could not read the page: ${e.message})`);
-        remember(snapshot);
-        const note = await loadingNote();
-        return `URL: ${page.url()}\nTitle: ${await page.title()}${note ? `\nNote:${note}` : ''}\n\n${short(snapshot, SNAPSHOT_CHARS)}`;
+        step('Looking at the screen');
+        const list = await markClickables(page);
+        let data = null;
+        try {
+          const size = page.viewportSize() || { width: 1366, height: 768 };
+          const cdp = await page.context().newCDPSession(page);
+          ({ data } = await cdp.send('Page.captureScreenshot', { format: 'jpeg', quality: 70, clip: { x: 0, y: 0, width: size.width, height: size.height, scale: 0.8 } }));
+          await cdp.detach().catch(() => {});
+        } catch {
+          data = null;
+        }
+        for (const frame of page.frames()) await frame.evaluate(() => document.querySelectorAll('[data-ba-mark]').forEach((e) => e.remove())).catch(() => {});
+        marks = { url: page.url(), list };
+        const text = `URL: ${page.url()}\nClickable things on screen (number: kind "label"):\n${list.map((m) => `${m.n}: ${m.tag} "${m.label}"`).join('\n') || '(none found)'}\nClick one with click_mark (number). Scroll and look again for more.`;
+        return data ? [{ type: 'text', text }, { type: 'image', image: `data:image/jpeg;base64,${data}`, detail: 'auto' }] : text;
+      }),
+    }),
+    tool({
+      name: 'click_mark',
+      description: 'Click the thing with this red number from your last look (only right after look, on the same page).',
+      parameters: z.object({ number: z.number().int() }),
+      execute: oneAtATime(async ({ number }) => {
+        if (outOfSteps()) return LIMIT;
+        const m = marks && marks.list.find((x) => x.n === number);
+        if (!m) return 'No such number: call look first, then use a number from it.';
+        if (marks.url !== page.url()) return 'The page changed since your last look: call look again.';
+        step(`Clicking ${m.tag} "${short(m.label || '#' + number, 60)}"`);
+        try {
+          await page.mouse.click(m.x, m.y);
+          marks = null;
+          return `Clicked. ${await after()}${await loginStillShown()}`;
+        } catch (err) {
+          return fail(err);
+        }
       }),
     }),
     tool({
@@ -431,6 +595,14 @@ function createBrowserTools(page, opts) {
         }
         if (!allowed(url)) return allowOtherSites ? 'Not allowed: that address is not a public website.' : `Not allowed: only pages on ${baseHost} can be opened.`;
         if (!known.has(url.split('#')[0])) return 'Not allowed: open_page opens only addresses that read_page has shown (copy a /url exactly). Find the link or menu on the page instead.';
+        // Leaving a page that is still working (an AI generation, an upload) cancels it: the first
+        // time, say so; a second open_page right after goes ahead.
+        const busy = leaveWarned === page.url() ? '' : await loadingNote();
+        if (busy) {
+          leaveWarned = page.url();
+          return `Not opened yet: this page is still working.${busy} Leaving now may cancel it (e.g. a generation). Wait for it first (wait, up to 180 s). If you are sure, call open_page again.`;
+        }
+        leaveWarned = '';
         step(`Opening ${short(url, 100)}`);
         try {
           const { response: r, slow } = await openUrl(page, url);
@@ -465,8 +637,12 @@ function createBrowserTools(page, opts) {
         try {
           const target = await element(role, name, index);
           if (!target) return failed(key, NOT_FOUND(role, name));
+          const was = { url: page.url(), sent: requestsSent, text: await pageTextSize() };
           await target.click({ timeout: 8000 });
-          return `Clicked. ${await after()}${await loginStillShown()}`;
+          const now = await after();
+          // a click that changed nothing: say so, or the model clicks it again and again
+          const nothing = page.url() === was.url && requestsSent === was.sent && (await pageTextSize()) === was.text;
+          return `Clicked. ${now}${nothing ? NOTHING_CHANGED : ''}${await loginStillShown()}`;
         } catch (err) {
           return failed(key, fail(err));
         }
@@ -488,6 +664,11 @@ function createBrowserTools(page, opts) {
             step(`Typing into ${role} "${short(name, 50)}"`);
             return failed(key, NOT_FOUND(role, name));
           }
+          // A field in a tab, section or step that is not open: typing there does not count
+          if (!(await field.isVisible().catch(() => true))) {
+            step(`Typing into ${role} "${short(name, 50)}"`);
+            return failed(key, `That ${role} is hidden right now: it sits in a tab, section or step that is not open. Select its tab (or open its section) first, then type into it. Use look to see the form.`);
+          }
           // A password nobody gave (e.g. a demo one printed on the page) is never typed: the user
           // decides which account the agent uses, through the login details.
           // A password field only ever gets {{PASSWORD}}: never another value (a guess, or the
@@ -500,6 +681,15 @@ function createBrowserTools(page, opts) {
             if (!/^\s*\{\{\s*PASSWORD\s*\}\}\s*$/.test(text)) {
               step('Stopped: only the given password may go into the password field');
               return 'Not allowed: the password field only takes {{PASSWORD}} (the user\'s own login). Never type any other password, not even one shown on the page. If the login failed, stop and tell the user their login details did not work.';
+            }
+          }
+          // On a login form (a password field is on screen) with login details given, the
+          // username / email field also only gets {{USERNAME}}, never a name shown on the page.
+          if (secrets.USERNAME && !secret && (await page.locator('input[type="password"]').filter({ visible: true }).count().catch(() => 0))) {
+            const what = await field.evaluate((el) => [el.type, el.name, el.id, el.autocomplete, el.placeholder, el.getAttribute('aria-label')].join(' ')).catch(() => '');
+            if (/user|email|e-mail|login|account|phone|mobile/i.test(`${what} ${name}`)) {
+              step('Stopped: only the given username may go into the login form');
+              return 'Not allowed: on this login form the username / email field only takes {{USERNAME}} (the user\'s own login). Type {{USERNAME}} exactly like that.';
             }
           }
           // the log shows the placeholder, never the real value
@@ -525,8 +715,12 @@ function createBrowserTools(page, opts) {
             return `Typed${submit ? ' (Enter was NOT pressed)' : ''}. Suggestions opened: ${suggestions.map((t) => JSON.stringify(t)).join(', ')}. Pick the right one with pick_suggestion so the site accepts the value${submit ? ', then search' : ''}.`;
           }
           if (submit) {
+            const was = { url: page.url(), sent: requestsSent, text: await pageTextSize() };
             await field.press('Enter');
-            return `Typed. ${await after()}${await loginStillShown()}`;
+            const now = await after();
+            // Enter often does nothing outside a <form>: say so, or the model reads the old page as the result
+            const nothing = page.url() === was.url && requestsSent === was.sent && (await pageTextSize()) === was.text;
+            return `Typed. ${now}${nothing ? ' Pressing Enter did NOTHING here (no search or page change started): click the Search / Submit button of the form instead. What the page shows now is NOT a result.' : ''}${await loginStillShown()}`;
           }
           return `Typed${filled ? '' : ' (but the field does not show the text: try another field or way)'}. ${await after()}`;
         } catch (err) {
@@ -585,24 +779,28 @@ function createBrowserTools(page, opts) {
     }),
     tool({
       name: 'wait',
-      description: 'Wait for the page to finish loading (e.g. search results that show "Loading…" or "0 results" at first). text (optional) = a text that will show once it has loaded, or a loading text to wait to go away; seconds = the longest to wait, up to 30.',
+      description: 'Wait for the page to finish loading or for slow work to finish (search results that show "Loading…" or "0 results" at first; AI generation like "Generating…" / "Creating your book…" which can take minutes). text (optional) = a text that will show once it is done, or a loading text to wait to go away; seconds = the longest to wait, up to 180.',
       parameters: z.object({ text: z.string().nullable(), seconds: z.number().nullable() }),
       execute: oneAtATime(async ({ text, seconds }) => {
         if (outOfSteps()) return LIMIT;
-        const ms = Math.min(30, Math.max(2, Number(seconds) || 15)) * 1000;
+        const ms = Math.min(180, Math.max(2, Number(seconds) || 15)) * 1000;
         step(text ? `Waiting for "${short(text, 50)}"` : `Waiting up to ${ms / 1000}s for the page`);
         const started = Date.now();
-        if (text && /loading|getting|fetching|searching|please wait|processing/i.test(text)) {
-          // a loading text: wait for it to go away
+        if (text && /loading|getting|fetching|searching|please wait|processing|generating|creating|writing|understanding|preparing|building|planning|crafting/i.test(text)) {
+          // a loading text: wait for it to go away, and for any other progress text too
           const gone = await page.getByText(text, { exact: false }).first().waitFor({ state: 'hidden', timeout: ms }).then(() => true, () => false);
-          if (!gone) return `"${text}" is still shown after ${ms / 1000}s.`;
+          if (!gone) return `"${text}" is still shown after ${ms / 1000}s: it is still working. Wait again.`;
+          while (Date.now() - started < ms && (await loadingNote())) await sleep(2000);
           await waitForQuiet(5000);
         } else if (text) {
           const shown = await page.getByText(text, { exact: false }).first().waitFor({ state: 'visible', timeout: ms }).then(() => true, () => false);
           if (!shown) return `"${text}" did not appear in ${ms / 1000}s.${await loadingNote()}`;
+          // the text can be part of a progress list ("Your book is ready!" as the last step): wait for the progress to end too
+          while (Date.now() - started < ms && (await loadingNote())) await sleep(2000);
         } else {
           await sleep(2000);
           await waitForQuiet(ms - 2000);
+          while (Date.now() - started < ms && (await loadingNote())) await sleep(2000);
         }
         return `Waited ${Math.round((Date.now() - started) / 1000)}s.${await loadingNote() || ' The page has finished loading.'} Call read_page to see it.`;
       }),

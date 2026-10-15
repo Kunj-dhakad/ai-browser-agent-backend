@@ -878,6 +878,9 @@ function launchOptions(overrides = {}) {
     ignoreDefaultArgs: ['--enable-automation'],
     args: [
       '--disable-blink-features=AutomationControlled',
+      // The real window as big as the page: in new headless it is smaller by default, and clicks
+      // on the right edge of the page (a cart icon, "Save" at the top right) went nowhere.
+      `--window-size=${CONFIG.viewport.width},${CONFIG.viewport.height}`,
       '--no-first-run',
       '--no-default-browser-check',
       // Keep painting when the headed window is hidden behind others, so the live preview doesn't freeze.
@@ -1222,7 +1225,26 @@ async function useRegularUserAgent(page) {
 async function openPage(context, { regularUserAgent = true } = {}) {
   const page = await context.newPage();
   if (regularUserAgent) page.uaSession = await useRegularUserAgent(page);
+  await fitWindow(page);
   return page;
+}
+
+/**
+ * Makes the real browser window as big as the page. A profile remembers its last window size
+ * (older ones: 800 x 600, over the --window-size flag), and in a window smaller than the page,
+ * clicks on the right side of the page (a cart icon, "Save" at the top right) go nowhere.
+ */
+async function fitWindow(page) {
+  try {
+    const cdp = await page.context().newCDPSession(page);
+    const { windowId, bounds } = await cdp.send('Browser.getWindowForTarget');
+    const { width, height } = CONFIG.viewport;
+    if (bounds.windowState !== 'normal') await cdp.send('Browser.setWindowBounds', { windowId, bounds: { windowState: 'normal' } });
+    if (bounds.width < width || bounds.height < height) await cdp.send('Browser.setWindowBounds', { windowId, bounds: { width, height } });
+    await cdp.detach().catch(() => {});
+  } catch {
+    // not available (e.g. some headed setups): the --window-size flag still applies
+  }
 }
 
 /** Opens Google's sign-in page in the user's browser, for them to fill in through the dashboard. */

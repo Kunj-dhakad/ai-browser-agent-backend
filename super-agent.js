@@ -22,7 +22,7 @@ const path = require('path');
 const { z } = require('zod');
 const { tool } = require('@openai/agents');
 const { buildWebAgent, WORKING_RULES, WEB, addUsage, tidyAnswer } = require('./web-agent');
-const { useOpenAI, runAgent, openUrl, findSources, aiModel, short, sleep, usageOf } = require('./ai-browser');
+const { useOpenAI, runAgent, openUrl, findSources, aiModel, askJson, short, sleep, usageOf } = require('./ai-browser');
 const { openParallelPage, createLogger, normalizeSiteUrl, blockPrivateHosts, AgentError, CONFIG } = require('./agent');
 const { runHistory } = require('./db');
 
@@ -99,8 +99,57 @@ function givePage() {
   else pagesInUse--;
 }
 
-/** Sent when the agent stopped after describing its next steps instead of doing them. */
-const CARRY_ON = "Don't describe what you will do: do it now with the tools and finish the task (save the data with save_data), then give your final answer.";
+// ---------------------------------------------------------------- is it really done?
+
+const CHECK_PROMPT = `You check whether a browser agent really finished the user's task. Reply as JSON: {"required": ["<each thing the task asks for, e.g. each city, each item, the total, the created book>"], "done": ["<the required things that the saved data or the page show as done>"], "status": "complete" | "unfinished" | "blocked", "missing": "<short: what is still to do, or what blocks it>"}.
+Fill "required" and "done" first, looking at BOTH the saved data rows and the page text; then decide: complete when every required thing is done.
+- complete: the task is done as asked: the answer, the saved data and the page agree (e.g. all items asked for are there; the thing to create was created and is shown).
+- unfinished: part of the task is not done and the agent could still do it: items missing, a step not taken, it stopped in a form or wizard, it only described what it would do, it asked the user for details it could choose itself (a topic, a title), it gave up while other ways were left, or a generation was started but not waited for and checked.
+- blocked: it cannot be done by the agent: the login details failed, the site blocks it, a captcha or one-time code, the thing does not exist on the site, or only the user can decide.
+If the page still shows progress text ("Loading…", "Generating…", "Understanding your idea…") or the agent's answer itself says it is not done yet, the status is unfinished.
+A task that creates or edits something (a book, a post, a record, a form) is complete only when it is saved: it shows in its list, or the agent pressed Save / Save & Next / Submit and the page confirms it. Ending in an open editor or draft that was not saved is unfinished: say "save it (e.g. Save & Next) and check it is in the list". The item in the list must be the new one (its title or topic fits what the agent made), not an older one.
+Judge by the evidence (the page text, the saved data), not by the agent's claims of success. You see only the start of the page text, so saved data that fits the task is evidence too: do not call a task unfinished only because its values are not in the excerpt. Ask only for what the task asks: no extra definitions, sources or checks it did not ask for. The page shows only where the agent is now: in a task over several items (several cities, pages, searches) the earlier items are proven by the saved data, not by the page.`;
+
+/** The model for the done check: a stronger one than the agent's (one short request per check). */
+const CHECK_MODEL = process.env.SUPER_CHECK_MODEL || 'gpt-4.1';
+
+/** The language (and script) the user wrote in, for the answer: the model often slips into English. */
+function answerLanguage(text) {
+  if (/[\u0900-\u097F]/.test(text)) return 'Hindi in Devanagari script';
+  const hinglish = (String(text).toLowerCase().match(/\b(hai|he|hain|karna|karo|kro|kar|ke|ki|ka|ko|do|dena|de|bana|bna|banao|nikal|nikalo|jana|jao|par|pr|aur|or|mein|me|kya|kaise|kese|sabse|wala|wali|batao|btao|chahiye|lana|lao|nahi|sath)\b/g) || []).length;
+  return hinglish >= 3 ? 'Hinglish written in English letters (Roman script, like the user), not Devanagari and not English' : 'the language the user wrote in';
+}
+
+/** { status: complete | unfinished | blocked, missing, usage } for the turn so far (complete if the check fails). */
+async function checkDone(lane, turn, answer, data, page) {
+  // the page and its frames (editors and widgets often live in an iframe)
+  const texts = await Promise.all(page.frames().slice(0, 6).map((f) => f.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '')));
+  const text = texts.filter((t) => t.trim()).join('\n---\n').replace(/\n\s*\n+/g, '\n');
+  // Evidence the excerpt can't show: how many saved values are on the page (the whole page)
+  const flat = (v) => String(v).toLowerCase().replace(/\s+/g, ' ').trim();
+  const pageFlat = flat(text);
+  const cells = data.rows.flat().map(flat).filter((v) => v.length >= 2).slice(0, 60);
+  const onPage = cells.filter((v) => pageFlat.includes(v)).length;
+  const user = [
+    `Task: ${lane.task}`,
+    turn.n > 1 ? `Latest message from the user: ${turn.message}` : '',
+    `Agent's answer: ${short(answer, 1500)}`,
+    // all of it (up to 40 rows): a task over several items (cities, pages) shows only the last one
+    // on screen, the earlier ones are in the data
+    `Data saved: ${data.rows.length} row(s)${data.rows.length ? ` with columns ${data.columns.join(' | ')}:\n${data.rows.slice(0, 40).map((r) => r.map((c) => short(c, 60)).join(' | ')).join('\n')}${data.rows.length > 40 ? `\n… and ${data.rows.length - 40} more rows` : ''}` : ''}`,
+    cells.length ? `Checked by code: ${onPage} of ${cells.length} saved values appear word for word in the page's full text (the page the agent is on now; data saved from earlier pages will not be in it).` : '',
+    `Page now: ${page.url()}`,
+    `Page text (start):\n${short(text, 3500)}`,
+  ].filter(Boolean).join('\n\n');
+  try {
+    const { data: v, usage } = await askJson(CHECK_MODEL, CHECK_PROMPT, user, AgentError);
+    const status = ['complete', 'unfinished', 'blocked'].includes(v.status) ? v.status : 'complete';
+    return { status, missing: short(String(v.missing || ''), 300), usage };
+  } catch (err) {
+    console.error('[super] The done check failed:', err.message);
+    return { status: 'complete', missing: '', usage: null };
+  }
+}
 
 // ---------------------------------------------------------------- the agent's prompt
 
@@ -119,6 +168,8 @@ The user's task:
 ${lane.task}
 
 ${where}
+
+Write your answers in ${answerLanguage(lane.task)}.
 
 ${WORKING_RULES(site || 'the websites you find', hasLogin, allowOtherSites, true)}`;
 };
@@ -227,6 +278,7 @@ function laneView(lane) {
       data: t.data,
       usage: t.usage,
       error: t.error,
+      check: t.check || null, // the done check: { status: complete | unfinished | blocked, missing }
     })),
   };
 }
@@ -397,22 +449,30 @@ async function runTurn(lane, turn) {
     let out = await runAgent(agent, input, { maxTurns: LIMITS.stepsPerTurn * 2 + 10, log, browser, label: 'The agent', signal: lane.abort.signal });
     if (out.stopped === 'account') throw new AgentError('AI_UNAVAILABLE', out.message);
     let usage = out.usage;
-    // The model sometimes stops after saying what it will do next ("Now I will sort them and
-    // save the 10 cheapest…") without doing it: tell it to carry on (at most twice).
-    for (let nudge = 0; nudge < 2 && out.result && !data.rows.length && !lane.abort.signal.aborted; nudge++) {
-      const said = String(out.result.finalOutput || '');
-      const promise = /\b(I will|I'll|I am going to|I'm going to|Let me (now )?(open|go|click|check|search|find|collect|save|read|sort|look)|Next,? I|Now,? I will|I need to)\b/i.test(said) && !/\?\s*$/.test(said);
-      // "I could not open it: the site blocks automated browsers. I will need…" is an answer, not a promise
-      const blocked = /\b(can'?not|can't|couldn'?t|could not|unable|not able|blocked|captcha|access denied|login details|not allowed|no (results|data))\b/i.test(said);
-      if (!promise || blocked || turn.asked || browser.outOfSteps()) break;
-      log.info('Continuing: the agent said what it would do next but stopped');
-      const again = await runAgent(agent, [...out.result.history, { role: 'user', content: CARRY_ON }], { maxTurns: LIMITS.stepsPerTurn * 2 + 10, log, browser, label: 'The agent', signal: lane.abort.signal });
+    // The model sometimes stops early (gives up, only says what it would do, asks for details it
+    // could choose): a check looks at the answer, the data and the page, and sends it back to
+    // work with what is missing (at most twice). Its last word also decides done / incomplete.
+    let verdict = null;
+    let cutOff = !out.result; // ran out of steps or time (or the AI failed) before answering
+    for (let round = 0; out.result && !turn.asked && !lane.abort.signal.aborted && round < 3; round++) {
+      verdict = await checkDone(lane, turn, scrub(String(out.result.finalOutput || '')), data, page);
+      usage = addUsage(usage, verdict.usage);
+      if (verdict.status !== 'unfinished') {
+        if (verdict.status === 'complete') log.info('Checked: the task is done');
+        if (verdict.status === 'blocked') log.info(`Checked: it cannot be finished here${verdict.missing ? ` (${verdict.missing})` : ''}`);
+        break;
+      }
+      if (round === 2 || browser.steps() > LIMITS.stepsPerTurn - 4) break;
+      log.info(`Not finished yet: ${verdict.missing || 'the task is not complete'}. Carrying on`);
+      const again = await runAgent(agent, [...out.result.history, { role: 'user', content: `Not finished yet: ${verdict.missing || 'the task is not complete'}. Keep going with the tools until it is really done (check it on the page), choosing any details yourself, then give your final answer in ${answerLanguage(lane.task)}.` }], { maxTurns: LIMITS.stepsPerTurn * 2 + 10, log, browser, label: 'The agent', signal: lane.abort.signal });
       usage = addUsage(usage, again.usage);
       if (!again.result) {
         out = { ...again, result: out.result };
+        cutOff = true;
         break;
       }
       out = again;
+      verdict = null;
     }
     if (out.result) lane.history = out.result.history;
     lane.lastUrl = page.url() !== 'about:blank' ? page.url() : lane.lastUrl;
@@ -426,22 +486,23 @@ async function runTurn(lane, turn) {
       turn.status = 'stopped';
       if (!turn.answer) turn.answer = data.rows.length ? `Stopped. ${data.rows.length} row(s) were saved before that.` : 'Stopped.';
     } else {
-      const cutOff = !out.result; // ran out of steps or time (or the AI failed) before answering
       if (!turn.answer) {
         turn.answer = data.rows.length ? `Collected ${data.rows.length} row(s) before stopping.` : 'The agent could not finish this.';
         if (out.stopped === 'time') turn.answer += ' It reached the time limit.';
         else if (out.stopped === 'steps') turn.answer += ' It used all its steps for this message.';
         turn.answer += ' Send a follow-up to continue, or give it a clearer way to do it.';
       }
-      // Only ask_user makes the turn wait for a reply; a finished task that offers more
-      // ("Want me to …?") is done, and one cut off with nothing saved is incomplete.
-      turn.status = turn.asked ? 'waiting' : cutOff && !data.rows.length ? 'incomplete' : 'done';
+      // Only ask_user makes the turn wait for a reply; the check says done or not; one cut off
+      // with nothing saved is incomplete.
+      const notDone = verdict && verdict.status !== 'complete';
+      turn.status = turn.asked ? 'waiting' : notDone || (cutOff && !data.rows.length) ? 'incomplete' : 'done';
+      turn.check = verdict ? { status: verdict.status, missing: verdict.missing } : null;
     }
     const n = browser.steps();
     const what = data.rows.length ? `${data.rows.length} row(s) of data` : '';
     if (turn.status === 'stopped') {
       // the stop is already in the log
-    } else if (turn.status === 'incomplete') log.warn('Could not finish this');
+    } else if (turn.status === 'incomplete') log.warn(`Could not finish this${turn.check && turn.check.missing ? `: ${turn.check.missing}` : ''}`);
     else if (turn.status === 'waiting') log.info('Waiting for your reply');
     else log.success(n ? `Done in ${n} step${n === 1 ? '' : 's'}${what ? `: ${what}` : ''}` : `Done${what ? `: ${what}` : ''}`);
     await shoot(lane, turn, page, 'End', { final: true });

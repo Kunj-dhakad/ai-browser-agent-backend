@@ -1,20 +1,4 @@
-/**
- * web-agent.js
- * ---------------------------------------------------------------------------
- * Custom web agent: the user describes a task on a website in plain words ("log in, open the
- * Orders tab, search INV-1023 and give me its date, amount and status") and an AI model
- * (OpenAI Agents SDK) does it in the user's agent browser, then returns an answer and the
- * data it collected as a table.
- *
- * Login details are typed by our code: the model only ever sees {{USERNAME}} / {{PASSWORD}}
- * (see ai-browser.js). They are not stored with the task or the result.
- *
- * Safety: the browser stays on the website unless the user allows other sites (sign-in
- * pages often live elsewhere), never reaches the server's own or private addresses, does not
- * change, delete, buy, pay, send or publish anything unless the task asks for exactly that,
- * treats page text as data and not instructions, and has a step limit.
- * ---------------------------------------------------------------------------
- */
+
 
 const { z } = require('zod');
 const { Agent, tool } = require('@openai/agents');
@@ -38,21 +22,27 @@ ${WORKING_RULES(site, hasLogin, allowOtherSites)}`;
 /** canAsk: the user can answer in a chat (super agent); otherwise nobody answers mid-task. */
 const WORKING_RULES = (site, hasLogin, allowOtherSites, canAsk = false) => `How to work:
 - The start page is already open: start with read_page. Find elements by their role and name exactly as read_page lists them (e.g. button "Sign in", link "Orders", textbox "Search").
-- After an action, call read_page again when you need to see the result.
+- After an action, call read_page again when you need to see the result. If read_page says a POPUP IS OPEN, deal with it first: popups (choose a type, confirm, settings) are often the next step.
+- Use look to see the screen when read_page is not enough: buttons or cards without names (arrows, icons), editors, layouts, or when a click seemed to do nothing. look numbers every clickable thing; click one with click_mark. A long page comes in parts: read_page part=2, 3…
+- Many web apps work as a wizard: pick a type or template, fill a form, press Next / Continue / Generate, wait, then Save / Publish. Follow it step by step to the end. When the work ends in an editor or a draft, save it (Save, Save & Next, Done, Publish only if the task asks to publish): unsaved work is lost when the browser closes.
+- Forms often have tabs or switches for the input (e.g. Description / PDF / URL): select the right tab BEFORE you type into it. Before you press the final button (Generate, Create, Submit, Save, Publish), use look to check the form: the right tab or option is selected and every required field is filled.
 - Menus are often closed: links you need may sit behind a menu button (☰, "Menu", "More", or a button with no name, usually top-left). Click it, then read_page again.
 - If clicking a link fails, open its /url from read_page with open_page instead. Only open addresses that read_page showed or the user gave you: never guess or make up an address.
 - ${hasLogin ? 'If you need to log in, type {{USERNAME}} into the username / email field and {{PASSWORD}} into the password field, exactly like that. The real values are filled in for you; you never see them and must never ask for them. Use only these: never type any other username or password, not even a demo or test one shown on the page. If the login fails, try once more at most, then stop and say the login details did not work.' : 'No login details were given. If the task needs a login, do not log in: never type a username or password, not even a demo or test one shown on the page. Stop and say that login details are needed.'}
 - When the page has a table, use read_tables to read it exactly. Save the data the user asked for with save_data: one row per item, short clear column names, the values exactly as the page shows them. Never invent or guess values; leave a cell empty if the page doesn't show it. Whenever the task asks for data, a list, values or details, save them with save_data before you answer, even if it is a single value.
 - Use check_text to confirm a value before you report it.
 - Search, location, city and address boxes often open a suggestion list while you type. type_text lists the suggestions: choose the matching one with pick_suggestion, otherwise the site may say the field is empty. If a box wants a city and the task names a country or region, use real cities in it (e.g. for "USA": New York, Los Angeles, Chicago, Houston, Phoenix...).
-- Results often load a few seconds after a search. Never decide that there are no results while the page shows "Loading…", "Getting…", "Please wait" or a spinner: use wait, then read_page again. Only "0 results" on a fully loaded page means nothing was found.
+- Results often load a few seconds after a search. Never decide that there are no results while the page shows "Loading…", "Getting…", "Please wait" or a spinner: use wait, then read_page again. Only "0 results" on a fully loaded page means nothing was found. A page often shows "0 results" / "No results found" before any search: that is not a result. If pressing Enter did nothing, click the Search / Submit button.
+- Some work takes minutes (AI generation: "Generating…", "Understanding your idea…", "Creating your book…", uploads, reports). After starting it, wait for it (wait with that text, up to 180 s, again if needed) and then check the result. Never decide it failed while it is still in progress.
 - For a task over several items (e.g. 10 cities, 5 products), do them one by one: search one, save its data with save_data, then the next. Keep going until all are done or steps run low.
 - When the task is done (or you are nearly out of steps), stop calling tools and answer in plain words: what you did, and the result (the main values, or a short summary of the data saved). If something stopped you, say exactly what.
-- Write the answer in the language the user wrote the task in (e.g. Hinglish for a Hinglish task). Keep it short; no closing offers like "Let me know if you need anything else".
+- Write the answer in the language AND the script the user wrote the task in: Hinglish written in English letters gets an answer in Hinglish in English letters (not Devanagari); Hindi in Devanagari gets Devanagari; English gets English. Keep it short; no closing offers like "Let me know if you need anything else".
+- Before you say a task is done, check it really is (read_page or look): the new item is in the list, the form was saved, the result is on screen. If it is not, keep working.
 
 Decide for yourself:
 - ${canAsk ? 'Decide for yourself whenever you sensibly can. Ask the user only when you truly need something only they can give or decide: a one-time code, a choice between real options, or a yes before you send, submit, buy, book or delete anything. Then call ask_user with one short, clear question and end your turn; the user answers in the chat. Never ask anything in your answer without ask_user.' : 'You cannot ask the user anything during the task and nobody will answer. Never end with a question or "let me know". When something is unclear, pick the most sensible reading of the task and do it.'}
-- When a way doesn't work, try another before giving up: a different field or button, the suggestion list, a menu, a simpler search term, another page of the site.
+- When the task leaves details open (a topic, title, name, description, sample text, options), choose sensible ones yourself that fit the task, use them, and say in your answer what you chose. Do not ask the user for them.
+- When a way doesn't work, try another before giving up: a different field or button, look at the screen, the suggestion list, a menu, a simpler search term, another page of the site. Use your steps: do not stop early while there are ways left to try.
 
 Rules:
 - ${allowOtherSites ? 'You may open other websites when the task needs it.' : `Stay on ${site}.`}
@@ -72,7 +62,7 @@ const SAVE_NOW = 'You have not saved any data yet. If you found the data the tas
 function tidyAnswer(text) {
   const all = String(text || '').trim();
   // whole sentences only (after . ! ? or a new line), at the very end
-  const tidy = all.replace(/(?:(?<=[.!?\n])\s*(?:let me know|feel free to|if you (?:need|want|would like)|would you like|do you want|is there anything else)[^.!?\n]*[.!?]*)+\s*$/i, '').trim();
+  const tidy = all.replace(/(?:(?<=[.!?\n])\s*(?:let me know|feel free to|if you (?:need|want|would like)|would you like|do you want|is there anything else|agar aap(?:ko)?|aapko agar|aur kuch|kuch aur|koi aur)[^.!?\n]*[.!?]*)+\s*$/i, '').trim();
   return tidy || all;
 }
 
@@ -82,13 +72,7 @@ function addUsage(a, b) {
   return { requests: (a.requests || 0) + (b.requests || 0), inputTokens: (a.inputTokens || 0) + (b.inputTokens || 0), outputTokens: (a.outputTokens || 0) + (b.outputTokens || 0) };
 }
 
-/**
- * Runs the custom web agent on `page` (already in the user's browser) and returns
- * { url, answer, data: { columns, rows }, steps, stoppedEarly, finalUrl, usedLogin, usage }.
- * helpers: { normalizeSiteUrl, blockPrivateHosts, AgentError }
- * preset (research agents): { name, instructions, columns?, prepare? } — their own prompt, the
- * table has exactly these columns when given, and prepare(page, log) runs before the AI starts.
- */
+
 async function runWebAgent(page, task, log, helpers, preset = null) {
   const { normalizeSiteUrl, blockPrivateHosts, AgentError } = helpers;
   if (!useOpenAI()) {
