@@ -260,7 +260,7 @@ function laneView(lane) {
   return {
     id: lane.id,
     title: lane.title,
-    status: lane.status, // queued | running | waiting (asked a question) | done | incomplete (ran out of steps / time) | stopped | failed
+    status: lane.status, // queued | running | waiting (asked a question) | done | incomplete (done, with a note of what is left) | stopped | failed
     site: lane.sites.map((u) => new URL(u).hostname.replace(/^www\./, '')).join(', '),
     hasLogin: lane.hasLogin,
     thinking: lane.thinking || '',
@@ -369,17 +369,18 @@ function saveRun(lane, { first = false } = {}) {
     source: 'prompt',
     prompt: lane.task,
     task: { type: 'super_task', title: lane.title, url: lane.url || undefined, instructions: lane.task, hasLogin: lane.hasLogin, messages: lane.turns.length },
-    status: isActive(lane) ? 'running' : lane.status === 'failed' || lane.status === 'incomplete' ? 'error' : 'success',
+    // a task that ran to the end is a success; what it could not do is a note on it (only real errors fail)
+    status: isActive(lane) ? 'running' : lane.status === 'failed' ? 'error' : 'success',
     createdAt: lane.createdAt,
     logs: lane.turns.flatMap((t) => t.steps.map((s, i) => ({ step: t.n * 1000 + i + 1, time: s.at, level: s.level, message: s.text }))),
     report: isActive(lane)
       ? null
       : {
-          success: lane.status !== 'failed' && lane.status !== 'incomplete',
+          success: lane.status !== 'failed',
           durationMs: (last.finishedAt || Date.now()) - lane.createdAt,
           result: { kind: 'super_task', url: lane.url || last.finalUrl || '', answer: last.answer || '', data: { columns, rows: rows.map((r) => r.slice(0, columns.length)) }, steps: lane.turns.reduce((n, t) => n + t.steps.length, 0), finalUrl: last.finalUrl, usedLogin: lane.hasLogin, usage: usageOf(usage, WEB.model), shots: lane.turns.flatMap((t) => t.shots.map((sh) => ({ id: sh.id, label: sh.label, at: sh.at, message: t.n }))) },
           ...(lane.status === 'failed' ? { error: { code: 'SUPER_FAILED', message: last.error || 'The task failed.' } } : {}),
-          ...(lane.status === 'incomplete' ? { error: { code: 'SUPER_INCOMPLETE', message: last.answer || 'The agent could not finish the task.' } } : {}),
+          ...(lane.status === 'incomplete' ? { note: (last.check && last.check.missing) || 'Not everything in the task could be done.' } : {}),
         },
   };
   try {
@@ -521,7 +522,7 @@ async function runTurn(lane, turn) {
     const what = data.rows.length ? `${data.rows.length} row(s) of data` : '';
     if (turn.status === 'stopped') {
       // the stop is already in the log
-    } else if (turn.status === 'incomplete') log.warn(`Could not finish this${turn.check && turn.check.missing ? `: ${turn.check.missing}` : ''}`);
+    } else if (turn.status === 'incomplete') log.info(`Done. Not everything could be done${turn.check && turn.check.missing ? `: ${turn.check.missing}` : ''}`);
     else if (turn.status === 'waiting') log.info('Waiting for your reply');
     else log.success(n ? `Done in ${n} step${n === 1 ? '' : 's'}${what ? `: ${what}` : ''}` : `Done${what ? `: ${what}` : ''}`);
     await shoot(lane, turn, page, 'End', { final: true });
