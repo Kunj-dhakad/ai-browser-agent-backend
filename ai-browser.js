@@ -242,7 +242,7 @@ async function suggestionsNear(field, typed = null, before = []) {
 }
 
 /** Waits (up to `ms`) for the suggestion list of a field to open; its items, or []. */
-async function waitForSuggestions(page, field, typed, before, ms = 6000) {
+async function waitForSuggestions(page, field, typed, before, ms = 4500) {
   const end = Date.now() + ms;
   for (;;) {
     let found = await readSuggestions(page);
@@ -352,7 +352,8 @@ function createBrowserTools(page, opts) {
   let busy = false;
   const step = (label) => {
     steps++;
-    log.action(label);
+    // icon-font characters (private use area) show as empty boxes: "[] Search" -> "Search"
+    log.action(label.replace(/[-]\s*/g, ''));
   };
   const LIMIT = 'STEP LIMIT REACHED: do not call more browser tools. Save or record what you have, then write your final answer now.';
   const outOfSteps = () => steps >= maxSteps;
@@ -375,14 +376,21 @@ function createBrowserTools(page, opts) {
   /** Waits (up to maxMs) until the site has no background request open for a moment. false if it is still busy. */
   const waitForQuiet = async (maxMs = QUIET_MAX_MS) => {
     const until = Date.now() + maxMs;
+    // Requests to other sites count too when the action started them (the first 3 s): a search
+    // often asks another service first (e.g. a map service for the city) and only then the site
+    // itself. Later ones (ads, analytics that never stop) are left out.
+    const since = Date.now() - 1500;
     let quietSince = 0;
     while (Date.now() < until) {
-      // a request open for over a minute is a long poll, not the page loading
       const host = new URL(page.url()).hostname;
-      const open = [...pending].filter(([r, t]) => Date.now() - t < 60000 && sameSite(r.url(), host)).length;
+      const open = [...pending].filter(([r, t]) => {
+        if (Date.now() - t >= 60000) return false; // open for over a minute: a long poll, not the page loading
+        return sameSite(r.url(), host) || (t >= since && t - since < 3000 && Date.now() - t < 15000);
+      }).length;
       if (open) quietSince = 0;
       else if (!quietSince) quietSince = Date.now();
-      else if (Date.now() - quietSince >= 700) return true;
+      // a moment of quiet: the next request of a chain starts right after the first one ends
+      else if (Date.now() - quietSince >= 1000) return true;
       await sleep(200);
     }
     return false;
@@ -708,7 +716,7 @@ function createBrowserTools(page, opts) {
           if (secret) log.info(`${filled ? 'Filled' : 'Could not fill'} the ${/PASSWORD/.test(text) ? 'password' : 'username'} field`);
           if (/PASSWORD/.test(text)) passwordTyped = true;
           // suggestion lists often take a few seconds (they ask the site's server)
-          const suggestions = keyByKey ? await waitForSuggestions(page, field, value, before, submit ? 4000 : 6000) : [];
+          const suggestions = keyByKey ? await waitForSuggestions(page, field, value, before, submit ? 3500 : 4500) : [];
           if (suggestions.length) {
             log.info(`${suggestions.length} suggestion(s) appeared`);
             // Enter on an open list usually leaves the value unaccepted: pick one first
