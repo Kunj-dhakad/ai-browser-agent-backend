@@ -1,7 +1,8 @@
 /**
  * super-agent.js
  * ---------------------------------------------------------------------------
- * Super Agent: up to 3 tasks ("lanes") at the same time per user, each in its own tab of the
+ * Super Agent: up to 3 tasks ("lanes") at the same time per user, plus up to 3 waiting in line
+ * ("next up": when a task finishes, it is cleared and the next one starts in its place), each in its own tab of the
  * user's browser, driven by the custom web agent (web-agent.js). A lane is a chat: the first
  * message is the task, later messages are follow-ups on the same work (the agent may also ask
  * the user a short question, e.g. for a one-time code). Instead of a live view, each turn keeps
@@ -26,7 +27,9 @@ const { openParallelPage, createLogger, normalizeSiteUrl, blockPrivateHosts, Age
 const { runHistory } = require('./db');
 
 const LIMITS = {
-  lanesPerUser: 3, // lanes per user, working or finished (a finished one is closed to make room)
+  lanesPerUser: 3, // lanes per user, working or finished (a finished one makes room for the next in line)
+  queuePerUser: 3, // tasks waiting in line per user
+  doneShowMs: 4000, // a finished task stays on screen this long before the next one takes its place
   // super agent tabs running at the same time on this server (each is about one browser's CPU)
   maxPages: Math.max(1, parseInt(process.env.SUPER_MAX_PAGES, 10) || CONFIG.maxBrowsers),
   stepsPerTurn: Math.min(60, Math.max(10, parseInt(process.env.SUPER_MAX_STEPS, 10) || 40)),
@@ -69,6 +72,15 @@ const userLanes = (userId) => {
   return lanesByUser.get(userId);
 };
 const isActive = (lane) => lane.status === 'running' || lane.status === 'queued';
+/** A finished lane can make room for the next task (one waiting for the user's reply keeps its place). */
+const isFinished = (lane) => !isActive(lane) && lane.status !== 'waiting';
+
+/** userId -> [{ id, message, title, allowOtherSites, createdAt }] (login details hidden): tasks waiting for a lane. */
+const queues = new Map();
+const userQueue = (userId) => {
+  if (!queues.has(userId)) queues.set(userId, []);
+  return queues.get(userId);
+};
 
 // ---------------------------------------------------------------- server-wide tab limit
 
@@ -226,16 +238,26 @@ function checkMessage(message) {
   return m;
 }
 
-/** A user has at most 3 lanes, working or finished: a finished one is closed to make room. */
-function checkRoom(userId) {
-  const lanes = [...userLanes(userId).values()];
-  if (lanes.length < LIMITS.lanesPerUser) return;
-  throw new AgentError(
-    'LANE_LIMIT',
-    lanes.every(isActive)
-      ? `All ${LIMITS.lanesPerUser} tasks are working. Wait for one to finish, close it (×), then send this.`
-      : `You can have ${LIMITS.lanesPerUser} tasks at a time. Close a finished one (×) to start a new one.`,
-  );
+/**
+ * Makes room for one more lane: true when there is a free place, or the oldest finished lane
+ * was cleared for it (its run stays on the Tasks page). False when all lanes are busy.
+ */
+function makeRoom(userId) {
+  const lanes = userLanes(userId);
+  if (lanes.size < LIMITS.lanesPerUser) return true;
+  const oldest = [...lanes.values()].filter(isFinished).sort((a, b) => a.updatedAt - b.updatedAt)[0];
+  if (!oldest) return false;
+  lanes.delete(oldest.id);
+  return true;
+}
+
+/** Starts the tasks waiting in line while there is room (after a task finishes or is cleared). */
+function startNext(userId) {
+  const queue = userQueue(userId);
+  while (queue.length && makeRoom(userId)) {
+    const item = queue.shift();
+    openLane(userId, item);
+  }
 }
 
 /** Drops the oldest finished lanes beyond the limit and lanes older than a day. */
@@ -311,6 +333,7 @@ async function runTurn(lane, turn) {
     turn.finishedAt = Date.now();
     touch(lane);
     saveRun(lane);
+    startNext(lane.userId);
     return;
   }
   lane.status = turn.status = 'running';
@@ -437,6 +460,8 @@ async function runTurn(lane, turn) {
     givePage();
     touch(lane);
     saveRun(lane);
+    // a finished task makes room for the next one in line (after a moment, so "Done" shows)
+    if (isFinished(lane) && userQueue(lane.userId).length) setTimeout(() => startNext(lane.userId), LIMITS.doneShowMs);
   }
 }
 
@@ -449,8 +474,10 @@ function newTurn(lane, message) {
 // ---------------------------------------------------------------- API
 
 /**
- * Starts a lane. input: { message, username?, password?, allowOtherSites? }. The first web
- * address in the message is where it starts; without one the agent searches the web.
+ * A new task. input: { message, username?, password?, allowOtherSites? }. Returns { lane } when
+ * it starts now (a free place, or the oldest finished lane is cleared for it) or { queued }
+ * when all lanes are busy: it then starts as soon as one finishes. The first web address in the
+ * message is where it starts; without one the agent searches the web.
  */
 function startLane(userId, input = {}) {
   const message = checkMessage(input.message);
@@ -458,7 +485,36 @@ function startLane(userId, input = {}) {
   const password = typeof input.password === 'string' ? input.password : '';
   if (username.length > 300 || password.length > 300) throw new AgentError('INVALID_TASK', 'The login details are too long.');
   prune(userId);
-  checkRoom(userId);
+  const item = { id: crypto.randomUUID(), message, title: titleOf(message), allowOtherSites: input.allowOtherSites === true, createdAt: Date.now() };
+  // Not enumerable: never part of JSON (API answers)
+  Object.defineProperty(item, 'secrets', { value: { USERNAME: username, PASSWORD: password }, enumerable: false });
+  const queue = userQueue(userId);
+  // in line behind the others, or a lane now (a finished lane makes room for it)
+  if (!queue.length && makeRoom(userId)) return { lane: openLane(userId, item) };
+  if (queue.length >= LIMITS.queuePerUser) {
+    throw new AgentError('LANE_LIMIT', `${LIMITS.lanesPerUser} tasks are open and ${LIMITS.queuePerUser} more are waiting in line. Send this when one of them has started.`);
+  }
+  queue.push(item);
+  return { queued: queueView(item, queue.length) };
+}
+
+/** A waiting task as the page sees it (position 1 = next to start). */
+function queueView(item, position) {
+  return { id: item.id, title: item.title, message: item.message, hasLogin: Boolean(item.secrets.USERNAME || item.secrets.PASSWORD), position, createdAt: new Date(item.createdAt).toISOString() };
+}
+
+/** Removes a task that is waiting in line (it never started, so it has no run). */
+function cancelQueued(userId, id) {
+  const queue = userQueue(userId);
+  const i = queue.findIndex((q) => q.id === id);
+  if (i >= 0) queue.splice(i, 1);
+  return { cancelled: true, missing: i < 0 };
+}
+
+/** Opens a lane for a task (from the message box or the line) and starts it. */
+function openLane(userId, item) {
+  const message = item.message;
+  const { USERNAME: username, PASSWORD: password } = item.secrets;
 
   // Every web address in the message: the first is where it starts, the others may be opened
   // too ("compare the price on hubspot.com with pipedrive.com").
@@ -473,11 +529,11 @@ function startLane(userId, input = {}) {
     id: crypto.randomUUID(),
     runId: crypto.randomUUID(),
     userId,
-    title: titleOf(message),
+    title: item.title,
     task: message,
     url: url || '',
     sites,
-    allowOtherSites: input.allowOtherSites === true,
+    allowOtherSites: item.allowOtherSites,
     hasLogin: Boolean(username || password),
     status: 'queued',
     createdAt: now,
@@ -528,6 +584,7 @@ function clearLane(userId, id) {
   if (!lane) return { cleared: true, missing: true };
   if (isActive(lane)) throw new AgentError('LANE_BUSY', 'Stop this task before clearing it.');
   userLanes(userId).delete(id);
+  startNext(userId);
   return { cleared: true };
 }
 
@@ -535,9 +592,11 @@ function clearLane(userId, id) {
 function listLanes(userId) {
   prune(userId);
   const lanes = [...userLanes(userId).values()].sort((a, b) => b.createdAt - a.createdAt);
+  const queue = userQueue(userId);
   return {
     lanes: lanes.map(laneView),
-    limits: { lanesPerUser: LIMITS.lanesPerUser, lanes: lanes.length, active: lanes.filter(isActive).length, serverBusy: pagesInUse >= LIMITS.maxPages },
+    queue: queue.map((q, i) => queueView(q, i + 1)),
+    limits: { lanesPerUser: LIMITS.lanesPerUser, queuePerUser: LIMITS.queuePerUser, lanes: lanes.length, active: lanes.filter(isActive).length, queued: queue.length, serverBusy: pagesInUse >= LIMITS.maxPages },
     serverStarted: SERVER_STARTED,
   };
 }
@@ -559,4 +618,4 @@ function runShot(runId, shotId) {
   }
 }
 
-module.exports = { startLane, followUp, stopLane, clearLane, listLanes, getShot, runShot, LIMITS };
+module.exports = { startLane, cancelQueued, followUp, stopLane, clearLane, listLanes, getShot, runShot, LIMITS };

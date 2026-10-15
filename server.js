@@ -815,7 +815,8 @@ app.get('/api/super/lanes', (req, res) => res.json({ success: true, ...superAgen
 app.post(
   '/api/super/lanes',
   route(async (req, res) => {
-    res.status(201).json({ success: true, lane: superAgent.startLane(req.user.id, req.body || {}) });
+    // { lane } when it started, { queued } when it waits in line for a free lane
+    res.status(201).json({ success: true, ...superAgent.startLane(req.user.id, req.body || {}) });
   })
 );
 
@@ -837,6 +838,13 @@ app.delete(
   '/api/super/lanes/:id',
   route(async (req, res) => {
     res.json({ success: true, ...superAgent.clearLane(req.user.id, req.params.id) });
+  })
+);
+
+app.delete(
+  '/api/super/queue/:id',
+  route(async (req, res) => {
+    res.json({ success: true, ...superAgent.cancelQueued(req.user.id, req.params.id) });
   })
 );
 
