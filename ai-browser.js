@@ -177,6 +177,30 @@ async function shownFrames(page) {
   return out;
 }
 
+// Buttons that can't be undone, and the words a task uses when it really asks for them.
+const RISKY = [
+  { kind: 'publish', label: /\b(publish|go live|make (it )?public)\b/i, asked: /\b(publish|go live|live kar|public)\w*/gi },
+  { kind: 'delete', label: /\b(delete|deactivate|erase|remove (my |the )?account)\b/i, asked: /\b(delete|remove|hata|mita|deactivate)\w*/gi },
+  { kind: 'buy', label: /\b(place (your |the )?order|buy now|pay( now)?|purchase|confirm (and )?pay|complete (the )?(order|purchase)|finish)\b/i, asked: /\b(order|buy|pay|purchase|khareed|finish)\w*/gi },
+  { kind: 'send', label: /^\s*send\b|\bsend (now|it|email|message|mail)\b|\bsubmit (order|payment)\b/i, asked: /\b(send|bhej|mail|message|reply)\w*|\bemail\b(?!\s*[:=-]?\s*\{\{USERNAME)/gi },
+];
+
+/** True when `text` asks for it: one of the words, not next to "don't" / "mat" / "nahi". */
+function askedFor(re, text) {
+  for (const m of String(text).matchAll(re)) {
+    const around = text.slice(Math.max(0, m.index - 25), m.index + m[0].length + 25);
+    if (!/\b(don'?t|do not|not|never|without|mat|nahi|nhi|na|bina)\b/i.test(around)) return true;
+  }
+  return false;
+}
+
+/** The kind of a risky button ("publish", "delete", "buy", "send") the task did not ask for, or null. */
+function unaskedRisk(label, task) {
+  if (task == null) return null; // no task text given: not checked here
+  const r = RISKY.find((x) => x.label.test(label || ''));
+  return r && !askedFor(r.asked, task) ? r.kind : null;
+}
+
 /** A field that opens suggestions while you type (location, city, address search...). */
 async function looksLikeAutocomplete(field) {
   return field
@@ -326,7 +350,7 @@ async function runAgent(agent, input, { maxTurns, log, browser, label = 'The AI 
 
 /**
  * The browser tools for an agent working on `page`.
- * opts: { startUrl, allowOtherSites, maxSteps, log, normalizeSiteUrl, secrets: { USERNAME, PASSWORD } | null, allowUrls: [] }
+ * opts: { startUrl, allowOtherSites, maxSteps, log, normalizeSiteUrl, secrets: { USERNAME, PASSWORD } | null, allowUrls: [], task? }
  * Returns { tools, oneAtATime, steps(), outOfSteps(), LIMIT }.
  */
 function createBrowserTools(page, opts) {
@@ -372,6 +396,27 @@ function createBrowserTools(page, opts) {
   page.on('request', track);
   page.on('requestfinished', untrack);
   page.on('requestfailed', untrack);
+
+  // The page size to go back to after mobile_view
+  const desktopSize = page.viewportSize() || { width: 1366, height: 768 };
+
+  // What page_health reports: the page's console errors and failed requests (last 40 of each)
+  const problems = { console: [], requests: [] };
+  const keep = (list, item) => {
+    list.push(item);
+    if (list.length > 40) list.shift();
+  };
+  page.on('console', (m) => {
+    if (m.type() === 'error') keep(problems.console, { url: page.url(), text: short(m.text(), 200) });
+  });
+  page.on('pageerror', (err) => keep(problems.console, { url: page.url(), text: short(`Uncaught: ${err.message}`, 200) }));
+  page.on('response', (r) => {
+    if (r.status() >= 400) keep(problems.requests, { url: page.url(), text: `${r.status()} ${short(r.url(), 120)}` });
+  });
+  page.on('requestfailed', (r) => {
+    const why = r.failure() && r.failure().errorText;
+    if (why && !/ERR_ABORTED|blockedbyclient/i.test(why)) keep(problems.requests, { url: page.url(), text: `${why} ${short(r.url(), 120)}` });
+  });
 
   /** Waits (up to maxMs) until the site has no background request open for a moment. false if it is still busy. */
   const waitForQuiet = async (maxMs = QUIET_MAX_MS) => {
@@ -461,6 +506,11 @@ function createBrowserTools(page, opts) {
       ? ' NOTE: the login form is still shown, so the login probably failed. Read the page for an error (e.g. "invalid email or password"). Try logging in at most once more; if it fails again, stop and tell the user the login details did not work.'
       : '';
   };
+  /** A button that would publish / delete / buy / send when the task did not ask for it: not clicked. */
+  const skipRisky = (kind, label) => {
+    log.info(`Skipped "${short(label, 50)}": the task did not ask to ${kind}`);
+    return `Not clicked: "${short(label, 60)}" would ${kind === 'buy' ? 'place an order or pay' : kind} something, and the task did not ask for that. Use the button that only saves (Save, Save as draft, Next) or stop before this step. Do this only when the user's task asks for exactly that.`;
+  };
   const NOTHING_CHANGED =
     ' NOTE: the click changed nothing (no new page, no request, same text). Do not click it again the same way: reload the page with open_page on the current address and try once more, or use look and click_mark, or another way (a menu, a link).';
   const NOT_FOUND = (role, name) =>
@@ -548,6 +598,83 @@ function createBrowserTools(page, opts) {
       }),
     }),
     tool({
+      name: 'page_health',
+      description: 'Health of the current page, for testing a website: load time, page size, console errors, failed requests (404 / 500 / network), broken images, and the page title and description.',
+      parameters: z.object({}),
+      execute: oneAtATime(async () => {
+        if (outOfSteps()) return LIMIT;
+        step('Checking the page health');
+        const facts = await page
+          .evaluate(() => {
+            const nav = performance.getEntriesByType('navigation')[0];
+            const ms = (v) => (v ? Math.round(v) : null);
+            const imgs = [...document.images];
+            const meta = document.querySelector('meta[name="description"]');
+            return {
+              domReadyMs: nav ? ms(nav.domContentLoadedEventEnd) : null,
+              loadMs: nav ? ms(nav.loadEventEnd) : null,
+              transferKb: nav ? Math.round((nav.transferSize || 0) / 1024) : null,
+              resources: performance.getEntriesByType('resource').length,
+              brokenImages: imgs.filter((i) => i.complete && i.naturalWidth === 0 && i.src).map((i) => i.src).slice(0, 8),
+              imagesWithoutAlt: imgs.filter((i) => !i.hasAttribute('alt')).length,
+              title: document.title,
+              description: meta ? meta.content : '',
+              h1: [...document.querySelectorAll('h1')].map((h) => h.innerText.trim()).slice(0, 3),
+            };
+          })
+          .catch(() => ({}));
+        const here = page.url();
+        const cons = problems.console.filter((p) => p.url === here).map((p) => p.text);
+        const reqs = problems.requests.filter((p) => p.url === here).map((p) => p.text);
+        return [
+          `URL: ${here}`,
+          `Load: DOM ready ${facts.domReadyMs ?? '?'} ms, fully loaded ${facts.loadMs ?? '?'} ms, ${facts.transferKb ?? '?'} KB HTML, ${facts.resources ?? '?'} other files`,
+          `Title: "${facts.title || ''}" | meta description: ${facts.description ? `"${short(facts.description, 160)}"` : 'none'} | h1: ${(facts.h1 || []).join(' / ') || 'none'}`,
+          `Console errors (${cons.length}): ${cons.join(' || ') || 'none'}`,
+          `Failed requests (${reqs.length}): ${reqs.join(' || ') || 'none'}`,
+          `Broken images: ${(facts.brokenImages || []).join(', ') || 'none'} | images without alt text: ${facts.imagesWithoutAlt ?? '?'}`,
+        ].join('\n');
+      }),
+    }),
+    tool({
+      name: 'mobile_view',
+      description: 'Test the page on a phone: on = show it at phone size (390 x 844) and return a screenshot plus layout checks (sideways scrolling, tiny text, small tap targets); off = back to desktop size.',
+      parameters: z.object({ on: z.boolean() }),
+      execute: oneAtATime(async ({ on }) => {
+        if (outOfSteps()) return LIMIT;
+        step(on ? 'Viewing the page at phone size' : 'Back to desktop size');
+        const desktop = desktopSize;
+        await page.setViewportSize(on ? { width: 390, height: 844 } : desktop).catch(() => {});
+        await sleep(1200);
+        if (!on) return `Back at desktop size. ${await after()}`;
+        const layout = await page
+          .evaluate(() => {
+            const wide = document.documentElement.scrollWidth;
+            const small = [...document.querySelectorAll('p, li, a, span, td')].filter((el) => {
+              const r = el.getBoundingClientRect();
+              return r.width && el.innerText && el.innerText.trim().length > 3 && parseFloat(getComputedStyle(el).fontSize) < 12;
+            }).length;
+            const taps = [...document.querySelectorAll('a, button, input, [role=button]')].filter((el) => {
+              const r = el.getBoundingClientRect();
+              return r.width && r.height && r.top < innerHeight && (r.width < 24 || r.height < 24);
+            }).length;
+            const overflowing = [...document.body.querySelectorAll('*')].filter((el) => el.getBoundingClientRect().right > innerWidth + 2).slice(0, 5).map((el) => el.tagName.toLowerCase() + (el.className && typeof el.className === 'string' ? '.' + el.className.split(' ')[0] : ''));
+            return { wide, inner: innerWidth, small, taps, overflowing };
+          })
+          .catch(() => ({}));
+        let data = null;
+        try {
+          const cdp = await page.context().newCDPSession(page);
+          ({ data } = await cdp.send('Page.captureScreenshot', { format: 'jpeg', quality: 70 }));
+          await cdp.detach().catch(() => {});
+        } catch {
+          data = null;
+        }
+        const text = `Phone size (390 px wide). Page width ${layout.wide ?? '?'} px${layout.wide > layout.inner + 2 ? ` — WIDER than the screen: it scrolls sideways (too wide: ${(layout.overflowing || []).join(', ')})` : ' (fits)'}. Text under 12 px: ${layout.small ?? '?'} elements. Tap targets under 24 px on screen: ${layout.taps ?? '?'}. Call mobile_view with on=false when done.`;
+        return data ? [{ type: 'text', text }, { type: 'image', image: `data:image/jpeg;base64,${data}`, detail: 'auto' }] : text;
+      }),
+    }),
+    tool({
       name: 'look',
       description: 'See the screen: a screenshot of what the page shows now, with a red number on every clickable thing, plus the list of those numbers. Use it when read_page is not enough: icons or cards without names, popups, editors, layouts, or to check what really happened after an action. Then click one with click_mark.',
       parameters: z.object({}),
@@ -579,6 +706,8 @@ function createBrowserTools(page, opts) {
         const m = marks && marks.list.find((x) => x.n === number);
         if (!m) return 'No such number: call look first, then use a number from it.';
         if (marks.url !== page.url()) return 'The page changed since your last look: call look again.';
+        const risk = unaskedRisk(m.label, opts.task);
+        if (risk) return skipRisky(risk, m.label);
         step(`Clicking ${m.tag} "${short(m.label || '#' + number, 60)}"`);
         try {
           await page.mouse.click(m.x, m.y);
@@ -641,6 +770,8 @@ function createBrowserTools(page, opts) {
             }
           }
         }
+        const risk = unaskedRisk(name, opts.task);
+        if (risk) return skipRisky(risk, name);
         step(`Clicking ${role} "${short(name, 60)}"`);
         try {
           const target = await element(role, name, index);

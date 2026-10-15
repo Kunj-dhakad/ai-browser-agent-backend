@@ -31,6 +31,7 @@ const WORKING_RULES = (site, hasLogin, allowOtherSites, canAsk = false) => `How 
 - ${hasLogin ? 'If you need to log in, type {{USERNAME}} into the username / email field and {{PASSWORD}} into the password field, exactly like that. The real values are filled in for you; you never see them and must never ask for them. Use only these: never type any other username or password, not even a demo or test one shown on the page. If the login fails, try once more at most, then stop and say the login details did not work.' : 'No login details were given. If the task needs a login, do not log in: never type a username or password, not even a demo or test one shown on the page. Stop and say that login details are needed.'}
 - When the page has a table, use read_tables to read it exactly. Save the data the user asked for with save_data: one row per item, short clear column names, the values exactly as the page shows them. Never invent or guess values; leave a cell empty if the page doesn't show it. Whenever the task asks for data, a list, values or details, save them with save_data before you answer, even if it is a single value.
 - Use check_text to confirm a value before you report it.
+- To test a website (QA): cover the main pages from the menu, not every page. On each, use page_health (load time, console errors, failed requests, broken images), look for visual problems, try the main buttons and forms with sample data (never real payments), and check the phone layout once with mobile_view. Then report each issue with where it is, steps, severity (High / Medium / Low) and a suggested fix, plus what you checked and found fine.
 - Search, location, city and address boxes often open a suggestion list while you type. type_text lists the suggestions: choose the matching one with pick_suggestion, otherwise the site may say the field is empty. If a box wants a city and the task names a country or region, use real cities in it (e.g. for "USA": New York, Los Angeles, Chicago, Houston, Phoenix...).
 - Results often load a few seconds after a search. Never decide that there are no results while the page shows "Loading…", "Getting…", "Please wait" or a spinner: use wait, then read_page again. Only "0 results" on a fully loaded page means nothing was found. A page often shows "0 results" / "No results found" before any search: that is not a result. If pressing Enter did nothing, click the Search / Submit button.
 - Some work takes minutes (AI generation: "Generating…", "Understanding your idea…", "Creating your book…", uploads, reports). After starting it, wait for it (wait with that text, up to 180 s, again if needed) and then check the result. Never decide it failed while it is still in progress.
@@ -94,6 +95,7 @@ async function runWebAgent(page, task, log, helpers, preset = null) {
   const prompt = preset ? preset.instructions : INSTRUCTIONS(startUrl, task, hasLogin, task.allowOtherSites);
   const { agent, browser, data, scrub } = buildWebAgent(page, {
     name: preset ? preset.name : 'Custom web agent',
+    task: preset ? undefined : task.instructions,
     prompt,
     startUrl,
     columns: preset && preset.columns,
@@ -144,7 +146,7 @@ async function runWebAgent(page, task, log, helpers, preset = null) {
  * The web agent itself (also used by super-agent.js, one per turn): the browser tools on
  * `page` plus save_data. Returns { agent, browser, data, scrub }; data is the table save_data
  * fills, scrub(text) masks the login values.
- * opts: { name, prompt, startUrl, columns?, allowOtherSites, allowUrls?, maxSteps, secrets, log, normalizeSiteUrl, extraTools? }
+ * opts: { name, prompt, task?, startUrl, columns?, allowOtherSites, allowUrls?, maxSteps, secrets, log, normalizeSiteUrl, extraTools? }
  */
 function buildWebAgent(page, opts) {
   const { prompt, startUrl, log, normalizeSiteUrl } = opts;
@@ -162,6 +164,7 @@ function buildWebAgent(page, opts) {
     log,
     normalizeSiteUrl,
     secrets,
+    task: opts.task, // the user's words: publish / delete / buy / send buttons only when they ask for it
   });
   const secretValues = [secrets.USERNAME, secrets.PASSWORD].filter((v) => v && String(v).length >= 3);
   // Never let a login value end up in the saved data or the answer.

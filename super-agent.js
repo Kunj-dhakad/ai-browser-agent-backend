@@ -108,7 +108,7 @@ Fill "required" and "done" first, looking at BOTH the saved data rows and the pa
 - blocked: it cannot be done by the agent: the login details failed, the site blocks it, a captcha or one-time code, the thing does not exist on the site, or only the user can decide.
 If the page still shows progress text ("Loading…", "Generating…", "Understanding your idea…") or the agent's answer itself says it is not done yet, the status is unfinished.
 A task that creates or edits something (a book, a post, a record, a form) is complete only when it is saved: it shows in its list, or the agent pressed Save / Save & Next / Submit and the page confirms it. Ending in an open editor or draft that was not saved is unfinished: say "save it (e.g. Save & Next) and check it is in the list". The item in the list must be the new one (its title or topic fits what the agent made), not an older one.
-Judge by the evidence (the page text, the saved data), not by the agent's claims of success. You see only the start of the page text, so saved data that fits the task is evidence too: do not call a task unfinished only because its values are not in the excerpt. Ask only for what the task asks: no extra definitions, sources or checks it did not ask for. The page shows only where the agent is now: in a task over several items (several cities, pages, searches) the earlier items are proven by the saved data, not by the page.`;
+Judge by the evidence (the page text, the saved data), not by the agent's claims of success. You see only the start of the page text, so saved data that fits the task is evidence too: do not call a task unfinished only because its values are not in the excerpt. Ask only for what the task asks: no extra definitions, sources or checks it did not ask for. Open-ended tasks (test a website, research a topic, "check everything") are complete when the answer is a fair, honest result of what was asked, covering the main parts (e.g. the main pages, the aspects named in the task): do not ask for every page or for perfection. The page shows only where the agent is now: in a task over several items (several cities, pages, searches) the earlier items are proven by the saved data, not by the page.`;
 
 /** The model for the done check: a stronger one than the agent's (one short request per check). */
 const CHECK_MODEL = process.env.SUPER_CHECK_MODEL || 'gpt-4.1';
@@ -138,6 +138,7 @@ async function checkDone(lane, turn, answer, data, page) {
     // on screen, the earlier ones are in the data
     `Data saved: ${data.rows.length} row(s)${data.rows.length ? ` with columns ${data.columns.join(' | ')}:\n${data.rows.slice(0, 40).map((r) => r.map((c) => short(c, 60)).join(' | ')).join('\n')}${data.rows.length > 40 ? `\n… and ${data.rows.length - 40} more rows` : ''}` : ''}`,
     cells.length ? `Checked by code: ${onPage} of ${cells.length} saved values appear word for word in the page's full text (the page the agent is on now; data saved from earlier pages will not be in it).` : '',
+    `Screenshots: the system takes them by itself while the agent works (${turn.shots.length} so far, with more at the end) and shows them to the user, so a task asking for screenshots has them.`,
     `Page now: ${page.url()}`,
     `Page text (start):\n${short(text, 3500)}`,
   ].filter(Boolean).join('\n\n');
@@ -450,6 +451,7 @@ async function runTurn(lane, turn) {
     const allowOtherSites = !lane.url || lane.allowOtherSites || lane.sites.length > 1;
     const { agent, browser, data, scrub } = buildWebAgent(page, {
       name: 'Super agent',
+      task: `${lane.task}\n${turn.message}`, // publish / delete / buy / send buttons only when asked
       prompt: PROMPT(lane, site, lane.hasLogin, allowOtherSites),
       startUrl: startUrl || 'about:blank',
       allowOtherSites,
