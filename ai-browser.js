@@ -115,11 +115,64 @@ async function typeKeyByKey(field, value) {
   await field.click({ timeout: 8000 });
   await field.fill('', { timeout: 5000 }).catch(() => {});
   await field.pressSequentially(value, { delay: 70, timeout: 20000 });
-  await sleep(1500); // time for the suggestions to load
+  await sleep(300);
 }
 
-// The items of an autocomplete list on common sites (ARIA, Google Places, jQuery UI, others).
-const SUGGESTIONS = '[role="option"], [role="listbox"] li, .pac-item, .ui-menu-item, .autocomplete-suggestion, [class*="suggestion"] li, [class*="autocomplete"] li, [class*="dropdown"] li';
+// The items of an autocomplete list on common sites (ARIA, Google Places, jQuery UI, others);
+// data-ba-sugg marks the items found under the field by suggestionsNear().
+const SUGGESTIONS = '[data-ba-sugg], [role="option"], [role="listbox"] li, .pac-item, .ui-menu-item, .autocomplete-suggestion, [class*="suggestion"] li, [class*="autocomplete"] li, [class*="dropdown"] li';
+
+/**
+ * Texts shown just under a field (where a suggestion list opens). With `typed` and `before`
+ * (the texts there before typing), the new ones that contain what was typed are marked
+ * data-ba-sugg and returned: suggestion lists built without ARIA roles or list items.
+ */
+async function suggestionsNear(field, typed = null, before = []) {
+  return field
+    .evaluate(
+      (input, { typed, before }) => {
+        const fr = input.getBoundingClientRect();
+        const word = typed ? typed.trim().toLowerCase().split(/\s+/)[0] : '';
+        document.querySelectorAll('[data-ba-sugg]').forEach((e) => e.removeAttribute('data-ba-sugg'));
+        const out = [];
+        for (const el of document.body.querySelectorAll('li, div, a, button, span, p, td')) {
+          if (el === input || el.contains(input)) continue;
+          const r = el.getBoundingClientRect();
+          if (!r.width || !r.height || r.height > 90 || r.top < fr.bottom - 4 || r.top > fr.bottom + 420 || r.right < fr.left - 40 || r.left > fr.right + 40) continue;
+          const t = (el.innerText || '').replace(/\s+/g, ' ').trim();
+          if (!t || t.length > 120) continue;
+          if (!typed) {
+            out.push({ t });
+            continue;
+          }
+          if (!t.toLowerCase().includes(word) || before.includes(t)) continue;
+          // the innermost element with this text, once
+          if ([...el.children].some((c) => (c.innerText || '').replace(/\s+/g, ' ').trim() === t)) continue;
+          out.push({ el, t });
+          if (out.length >= 60) break;
+        }
+        if (!typed) return out.map((o) => o.t).slice(0, 300);
+        // the items, not the box around them: keep only elements that hold no other match
+        const items = out.filter((o) => !out.some((x) => x !== o && o.el.contains(x.el))).slice(0, 8);
+        items.forEach((o) => o.el.setAttribute('data-ba-sugg', '1'));
+        return items.map((o) => o.t.slice(0, 100));
+      },
+      { typed, before },
+      { timeout: 3000 },
+    )
+    .catch(() => []);
+}
+
+/** Waits (up to `ms`) for the suggestion list of a field to open; its items, or []. */
+async function waitForSuggestions(page, field, typed, before, ms = 6000) {
+  const end = Date.now() + ms;
+  for (;;) {
+    let found = await readSuggestions(page);
+    if (!found.length) found = await suggestionsNear(field, typed, before);
+    if (found.length || Date.now() > end) return found;
+    await sleep(400);
+  }
+}
 
 /** The visible suggestions of an open autocomplete list (first 8). */
 async function readSuggestions(page) {
@@ -294,6 +347,15 @@ function createBrowserTools(page, opts) {
     }
     return null;
   };
+  // After the password was typed and the form sent: the login form still there = it failed.
+  let passwordTyped = false;
+  const loginStillShown = async () => {
+    if (!passwordTyped) return '';
+    const still = await page.locator('input[type="password"]').filter({ visible: true }).count().catch(() => 0);
+    return still
+      ? ' NOTE: the login form is still shown, so the login probably failed. Read the page for an error (e.g. "invalid email or password"). Try logging in at most once more; if it fails again, stop and tell the user the login details did not work.'
+      : '';
+  };
   const NOT_FOUND = (role, name) =>
     `Not found: there is no ${role} "${short(name, 60)}" on the page now (names change, e.g. "Cart, 1 item"). Call read_page and use a name exactly as it lists it.`;
   const fail = (err) => `Failed: ${short(String(err && err.message ? err.message : err).split('\n')[0], 200)}`;
@@ -404,7 +466,7 @@ function createBrowserTools(page, opts) {
           const target = await element(role, name, index);
           if (!target) return failed(key, NOT_FOUND(role, name));
           await target.click({ timeout: 8000 });
-          return `Clicked. ${await after()}`;
+          return `Clicked. ${await after()}${await loginStillShown()}`;
         } catch (err) {
           return failed(key, fail(err));
         }
@@ -428,14 +490,23 @@ function createBrowserTools(page, opts) {
           }
           // A password nobody gave (e.g. a demo one printed on the page) is never typed: the user
           // decides which account the agent uses, through the login details.
-          if (!secrets.PASSWORD && (await field.getAttribute('type', { timeout: 2000 }).catch(() => '')) === 'password') {
-            step('Stopped at the password field: no login details were given');
-            return 'Not allowed: no login details were given for this task, so do not type any password (not even one shown on the page). Stop and tell the user to add login details and send the task again.';
+          // A password field only ever gets {{PASSWORD}}: never another value (a guess, or the
+          // demo one a login page shows after the user's details failed).
+          if ((await field.getAttribute('type', { timeout: 2000 }).catch(() => '')) === 'password') {
+            if (!secrets.PASSWORD) {
+              step('Stopped at the password field: no login details were given');
+              return 'Not allowed: no login details were given for this task, so do not type any password (not even one shown on the page). Stop and tell the user to add login details and send the task again.';
+            }
+            if (!/^\s*\{\{\s*PASSWORD\s*\}\}\s*$/.test(text)) {
+              step('Stopped: only the given password may go into the password field');
+              return 'Not allowed: the password field only takes {{PASSWORD}} (the user\'s own login). Never type any other password, not even one shown on the page. If the login failed, stop and tell the user their login details did not work.';
+            }
           }
           // the log shows the placeholder, never the real value
           step(`Typing ${secret ? text : `"${short(text, 40)}"`} into ${role} "${short(name, 50)}"${submit ? ' and pressing Enter' : ''}`);
           const value = withSecrets(text);
           const keyByKey = !secret && (/combobox|searchbox/i.test(role) || (await looksLikeAutocomplete(field)));
+          const before = keyByKey ? await suggestionsNear(field) : [];
           if (keyByKey) {
             await typeKeyByKey(field, value);
           } else {
@@ -445,14 +516,17 @@ function createBrowserTools(page, opts) {
           }
           const filled = (await field.inputValue({ timeout: 2000 }).catch(() => null)) === value;
           if (secret) log.info(`${filled ? 'Filled' : 'Could not fill'} the ${/PASSWORD/.test(text) ? 'password' : 'username'} field`);
-          if (submit) {
-            await field.press('Enter');
-            return `Typed. ${await after()}`;
-          }
-          const suggestions = keyByKey ? await readSuggestions(page) : [];
+          if (/PASSWORD/.test(text)) passwordTyped = true;
+          // suggestion lists often take a few seconds (they ask the site's server)
+          const suggestions = keyByKey ? await waitForSuggestions(page, field, value, before, submit ? 4000 : 6000) : [];
           if (suggestions.length) {
             log.info(`${suggestions.length} suggestion(s) appeared`);
-            return `Typed. Suggestions opened: ${suggestions.map((t) => JSON.stringify(t)).join(', ')}. Pick the right one with pick_suggestion so the site accepts the value.`;
+            // Enter on an open list usually leaves the value unaccepted: pick one first
+            return `Typed${submit ? ' (Enter was NOT pressed)' : ''}. Suggestions opened: ${suggestions.map((t) => JSON.stringify(t)).join(', ')}. Pick the right one with pick_suggestion so the site accepts the value${submit ? ', then search' : ''}.`;
+          }
+          if (submit) {
+            await field.press('Enter');
+            return `Typed. ${await after()}${await loginStillShown()}`;
           }
           return `Typed${filled ? '' : ' (but the field does not show the text: try another field or way)'}. ${await after()}`;
         } catch (err) {
