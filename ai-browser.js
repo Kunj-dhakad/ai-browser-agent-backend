@@ -12,6 +12,7 @@
 
 require('dotenv').config();
 
+const fs = require('fs');
 const OpenAI = require('openai');
 const { z } = require('zod');
 const { tool, run, setDefaultOpenAIClient, setTracingDisabled } = require('@openai/agents');
@@ -234,7 +235,8 @@ async function suggestionsNear(field, typed = null, before = []) {
     .evaluate(
       (input, { typed, before }) => {
         const fr = input.getBoundingClientRect();
-        const word = typed ? typed.trim().toLowerCase().split(/\s+/)[0] : '';
+        // a real word of what was typed ("a", "of" match everything)
+        const word = typed ? (typed.trim().toLowerCase().split(/\s+/).find((w) => w.length >= 3) || typed.trim().toLowerCase()) : '';
         document.querySelectorAll('[data-ba-sugg]').forEach((e) => e.removeAttribute('data-ba-sugg'));
         const out = [];
         for (const el of document.body.querySelectorAll('li, div, a, button, span, p, td')) {
@@ -396,6 +398,42 @@ function createBrowserTools(page, opts) {
   page.on('request', track);
   page.on('requestfinished', untrack);
   page.on('requestfailed', untrack);
+
+  // Files for the user (opts.onFile: { buffer, name, mime, source } -> a short note): a download
+  // the page starts (a Download button) is kept too.
+  const FILE_MAX = 25 * 1024 * 1024;
+  const downloads = []; // downloads started by the last action (promises of a note)
+  const keepFile = async (file) => {
+    if (!opts.onFile) return 'Files cannot be kept in this task.';
+    if (!file.buffer || !file.buffer.length) return 'The file was empty.';
+    if (file.buffer.length > FILE_MAX) return `The file is too big to keep (${Math.round(file.buffer.length / 1048576)} MB; at most 25 MB).`;
+    return opts.onFile(file);
+  };
+  if (opts.onFile) {
+    page.on('download', (d) => {
+      // the click that started it waits for this and tells the model (see downloadNote)
+      downloads.push(
+        (async () => {
+          try {
+            const p = await d.path();
+            const buffer = p ? fs.readFileSync(p) : null;
+            return `A download started and the file was KEPT for the user: ${await keepFile({ buffer, name: d.suggestedFilename(), mime: '', source: d.url() })}.`;
+          } catch (err) {
+            log.warn(`A download could not be kept: ${short(err.message, 120)}`);
+            return `A download started but could not be kept (${short(err.message, 80)}).`;
+          }
+        })(),
+      );
+    });
+  }
+  /** After a click: waits (up to 60 s) for downloads it started and says what was kept, or ''. */
+  const downloadNote = async () => {
+    await sleep(300); // a download starts a moment after the click
+    if (!downloads.length) return '';
+    const started = downloads.splice(0);
+    const notes = await Promise.race([Promise.all(started), sleep(60000).then(() => ['A download is still running.'])]);
+    return ` ${notes.join(' ')}`;
+  };
 
   // The page size to go back to after mobile_view
   const desktopSize = page.viewportSize() || { width: 1366, height: 768 };
@@ -598,6 +636,76 @@ function createBrowserTools(page, opts) {
       }),
     }),
     tool({
+      name: 'list_media',
+      description: 'List the images, videos and file links on the current page (biggest first), with their full addresses: use it to find a generated or found image / file, then download_file to keep it for the user and save_data to record its address.',
+      parameters: z.object({}),
+      execute: oneAtATime(async () => {
+        if (outOfSteps()) return LIMIT;
+        step('Listing the images and files on the page');
+        const found = [];
+        for (const frame of [page.mainFrame(), ...(await shownFrames(page))]) {
+          const items = await frame
+            .evaluate(() => {
+              const abs = (u) => { try { return new URL(u, location.href).href; } catch { return ''; } };
+              const out = [];
+              document.querySelectorAll('img, video, source, a[href]').forEach((el) => {
+                const r = el.getBoundingClientRect();
+                if (el.tagName === 'A') {
+                  const href = abs(el.getAttribute('href'));
+                  if (/\.(png|jpe?g|webp|gif|svg|mp4|webm|pdf|zip|csv|xlsx?|docx?|mp3|wav)(\?|#|$)/i.test(href) || el.hasAttribute('download')) out.push({ kind: 'file link', url: href, label: (el.innerText || el.getAttribute('download') || '').trim().slice(0, 60), size: 0 });
+                  return;
+                }
+                const src = el.currentSrc || el.src || el.getAttribute('src') || '';
+                if (!src || r.width < 40 || r.height < 40) return;
+                out.push({ kind: el.tagName === 'IMG' ? 'image' : 'video', url: src.startsWith('data:') ? src.slice(0, 40) + '…(inline image)' : abs(src), label: (el.alt || el.title || '').slice(0, 60), size: Math.round(r.width * r.height), dims: Math.round(r.width) + 'x' + Math.round(r.height) });
+              });
+              return out;
+            })
+            .catch(() => []);
+          found.push(...items);
+        }
+        const list = found.sort((a, b) => b.size - a.size).slice(0, 15);
+        list.forEach((m) => { if (/^https?:/.test(m.url)) allowUrl(m.url); });
+        return list.length
+          ? list.map((m, i) => `${i + 1}. ${m.kind}${m.dims ? ` ${m.dims}` : ''}${m.label ? ` "${m.label}"` : ''}: ${m.url}`).join('\n') + '\nKeep one for the user with download_file (its address), and record the address with save_data.'
+          : 'No images, videos or file links on this page.';
+      }),
+    }),
+    tool({
+      name: 'download_file',
+      description: 'Keep a file for the user: an image, video or document at this address (from list_media or read_page). It is saved with the task and the user can download it. name = a short file name (optional).',
+      parameters: z.object({ url: z.string(), name: z.string().nullable() }),
+      execute: oneAtATime(async ({ url, name }) => {
+        if (outOfSteps()) return LIMIT;
+        step(`Saving the file ${short(name || url, 70)}`);
+        try {
+          let buffer = null;
+          let mime = '';
+          if (/^(blob|data):/i.test(url)) {
+            // made in the page: read it there
+            const got = await page.evaluate(async (u) => {
+              const blob = await (await fetch(u)).blob();
+              const b64 = await new Promise((ok) => { const r = new FileReader(); r.onload = () => ok(String(r.result).split(',')[1] || ''); r.readAsDataURL(blob); });
+              return { b64, type: blob.type };
+            }, url);
+            buffer = Buffer.from(got.b64, 'base64');
+            mime = got.type;
+          } else {
+            const full = new URL(url, page.url()).toString();
+            if (!normalizeSiteUrl(full)) return 'Not allowed: that address is not a public website.';
+            const res = await page.request.get(full, { timeout: 60000, maxRedirects: 5 });
+            if (!res.ok()) return `The file could not be fetched (the site answered ${res.status()}).`;
+            buffer = await res.body();
+            mime = (res.headers()['content-type'] || '').split(';')[0];
+          }
+          const fallback = (url.split(/[?#]/)[0].split('/').pop() || 'file').slice(0, 80);
+          return `Saved for the user: ${await keepFile({ buffer, name: name || fallback, mime, source: /^data:/i.test(url) ? '' : url })}`;
+        } catch (err) {
+          return fail(err);
+        }
+      }),
+    }),
+    tool({
       name: 'page_health',
       description: 'Health of the current page, for testing a website: load time, page size, console errors, failed requests (404 / 500 / network), broken images, and the page title and description.',
       parameters: z.object({}),
@@ -712,7 +820,7 @@ function createBrowserTools(page, opts) {
         try {
           await page.mouse.click(m.x, m.y);
           marks = null;
-          return `Clicked. ${await after()}${await loginStillShown()}`;
+          return `Clicked. ${await after()}${await downloadNote()}${await loginStillShown()}`;
         } catch (err) {
           return fail(err);
         }
@@ -777,11 +885,22 @@ function createBrowserTools(page, opts) {
           const target = await element(role, name, index);
           if (!target) return failed(key, NOT_FOUND(role, name));
           const was = { url: page.url(), sent: requestsSent, text: await pageTextSize() };
+          const unchanged = async () => page.url() === was.url && requestsSent === was.sent && (await pageTextSize()) === was.text;
           await target.click({ timeout: 8000 });
-          const now = await after();
+          let now = await after();
+          let kept = await downloadNote();
+          // A mouse click some sites ignore now and then (their handler waits for something): one
+          // click from the page's own script (element.click()) usually does it.
+          let byScript = false;
+          if (!kept && (await unchanged()) && (await target.count().catch(() => 0))) {
+            await target.evaluate((el) => el.click()).catch(() => {});
+            now = await after();
+            kept = await downloadNote();
+            byScript = !(await unchanged());
+          }
           // a click that changed nothing: say so, or the model clicks it again and again
-          const nothing = page.url() === was.url && requestsSent === was.sent && (await pageTextSize()) === was.text;
-          return `Clicked. ${now}${nothing ? NOTHING_CHANGED : ''}${await loginStillShown()}`;
+          const nothing = !byScript && (await unchanged());
+          return `Clicked${byScript ? ' (the mouse click did nothing; a script click worked)' : ''}. ${now}${nothing && !kept ? NOTHING_CHANGED : ''}${kept}${await loginStillShown()}`;
         } catch (err) {
           return failed(key, fail(err));
         }
@@ -834,7 +953,9 @@ function createBrowserTools(page, opts) {
           // the log shows the placeholder, never the real value
           step(`Typing ${secret ? text : `"${short(text, 40)}"`} into ${role} "${short(name, 50)}"${submit ? ' and pressing Enter' : ''}`);
           const value = withSecrets(text);
-          const keyByKey = !secret && (/combobox|searchbox/i.test(role) || (await looksLikeAutocomplete(field)));
+          // a sentence (a prompt, a description) is not a city or a search term: no suggestion list to wait for
+          const sentence = value.length > 45 || value.trim().split(/\s+/).length > 6;
+          const keyByKey = !secret && !sentence && (/combobox|searchbox/i.test(role) || (await looksLikeAutocomplete(field)));
           const before = keyByKey ? await suggestionsNear(field) : [];
           if (keyByKey) {
             await typeKeyByKey(field, value);

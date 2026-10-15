@@ -146,6 +146,7 @@ function statusForError(code) {
     case 'USER_NOT_FOUND':
     case 'LANE_NOT_FOUND':
     case 'SHOT_NOT_FOUND':
+    case 'FILE_NOT_FOUND':
       return 404;
     case 'LANE_LIMIT':
     case 'LANE_BUSY':
@@ -852,6 +853,22 @@ app.get(
   '/api/super/lanes/:id/shots/:shot',
   route(async (req, res) => {
     res.json({ success: true, shot: superAgent.getShot(req.user.id, req.params.id, req.params.shot) });
+  })
+);
+
+/** A file the Super Agent kept for the user: { file: { id, name, mime, size, data (base64) } }. */
+app.get(
+  '/api/super/lanes/:id/files/:file',
+  route(async (req, res) => {
+    res.json({ success: true, file: superAgent.getFile(req.user.id, req.params.id, req.params.file) });
+  })
+);
+
+app.get(
+  '/api/agent/runs/:id/files/:file',
+  route(async (req, res) => {
+    if (!findRun(req, res)) return;
+    res.json({ success: true, file: superAgent.runFile(req.params.id, req.params.file) });
   })
 );
 

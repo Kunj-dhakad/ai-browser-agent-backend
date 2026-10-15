@@ -44,6 +44,23 @@ const LIMITS = {
 /** Screenshots are also saved here (data/super-shots/<runId>/<shot>.jpg) for the Tasks page. */
 const SHOTS_DIR = path.resolve(process.env.SUPER_SHOTS_DIR || './data/super-shots');
 const SHOT_ID = /^\d{1,3}-\d{1,3}$/;
+/** Files kept for the user (download_file, Download buttons): data/super-files/<runId>/<id> (+ <id>.json). */
+const FILES_DIR = path.resolve(process.env.SUPER_FILES_DIR || './data/super-files');
+const FILE_ID = SHOT_ID;
+const FILES_PER_TURN = 10;
+
+/** The type of a file from its first bytes, else its name. */
+function mimeOf(buffer, name, given) {
+  const head = buffer.subarray(0, 12).toString('hex');
+  if (head.startsWith('89504e47')) return 'image/png';
+  if (head.startsWith('ffd8ff')) return 'image/jpeg';
+  if (head.startsWith('47494638')) return 'image/gif';
+  if (head.startsWith('52494646') && buffer.subarray(8, 12).toString() === 'WEBP') return 'image/webp';
+  if (head.startsWith('25504446')) return 'application/pdf';
+  if (given && given !== 'application/octet-stream') return given;
+  const ext = (String(name).match(/\.([a-z0-9]+)$/i) || [])[1] || '';
+  return { svg: 'image/svg+xml', mp4: 'video/mp4', webm: 'video/webm', csv: 'text/csv', txt: 'text/plain', zip: 'application/zip', mp3: 'audio/mpeg' }[ext.toLowerCase()] || 'application/octet-stream';
+}
 const RUN_ID = /^[0-9a-f-]{36}$/i;
 
 /** When this server process started: the page sees a restart (which ends all working lanes). */
@@ -51,16 +68,16 @@ const SERVER_STARTED = new Date().toISOString();
 
 /** Old saved screenshots are removed (once at start, then daily). */
 function pruneShots() {
-  fs.readdir(SHOTS_DIR, { withFileTypes: true }, (err, dirs) => {
+  [SHOTS_DIR, FILES_DIR].forEach((root) => fs.readdir(root, { withFileTypes: true }, (err, dirs) => {
     if (err) return;
     const old = Date.now() - LIMITS.shotsDays * 86400000;
     dirs.filter((d) => d.isDirectory()).forEach((d) => {
-      const dir = path.join(SHOTS_DIR, d.name);
+      const dir = path.join(root, d.name);
       fs.stat(dir, (e, st) => {
         if (!e && st.mtimeMs < old) fs.rm(dir, { recursive: true, force: true }, () => {});
       });
     });
-  });
+  }));
 }
 pruneShots();
 setInterval(pruneShots, 86400000).unref();
@@ -107,6 +124,7 @@ Fill "required" and "done" first, looking at BOTH the saved data rows and the pa
 - unfinished: part of the task is not done and the agent could still do it: items missing, a step not taken, it stopped in a form or wizard, it only described what it would do, it asked the user for details it could choose itself (a topic, a title), it gave up while other ways were left, or a generation was started but not waited for and checked.
 - blocked: it cannot be done by the agent: the login details failed, the site blocks it, a captcha or one-time code, the thing does not exist on the site, or only the user can decide.
 If the page still shows progress text ("Loading…", "Generating…", "Understanding your idea…") or the agent's answer itself says it is not done yet, the status is unfinished.
+A task that makes an image, video or file for the user (generate, create, download) is complete only when that file is kept for the user (see "Files kept") or its address is in the saved data. When "Files kept" lists the file the task asked for, that part IS done, even if later tries failed or the agent's answer says otherwise.
 A task that creates or edits something (a book, a post, a record, a form) is complete only when it is saved: it shows in its list, or the agent pressed Save / Save & Next / Submit and the page confirms it. Ending in an open editor or draft that was not saved is unfinished: say "save it (e.g. Save & Next) and check it is in the list". The item in the list must be the new one (its title or topic fits what the agent made), not an older one.
 Judge by the evidence (the page text, the saved data), not by the agent's claims of success. You see only the start of the page text, so saved data that fits the task is evidence too: do not call a task unfinished only because its values are not in the excerpt. Ask only for what the task asks: no extra definitions, sources or checks it did not ask for. Open-ended tasks (test a website, research a topic, "check everything") are complete when the answer is a fair, honest result of what was asked, covering the main parts (e.g. the main pages, the aspects named in the task): do not ask for every page or for perfection. The page shows only where the agent is now: in a task over several items (several cities, pages, searches) the earlier items are proven by the saved data, not by the page.`;
 
@@ -138,6 +156,7 @@ async function checkDone(lane, turn, answer, data, page) {
     // on screen, the earlier ones are in the data
     `Data saved: ${data.rows.length} row(s)${data.rows.length ? ` with columns ${data.columns.join(' | ')}:\n${data.rows.slice(0, 40).map((r) => r.map((c) => short(c, 60)).join(' | ')).join('\n')}${data.rows.length > 40 ? `\n… and ${data.rows.length - 40} more rows` : ''}` : ''}`,
     cells.length ? `Checked by code: ${onPage} of ${cells.length} saved values appear word for word in the page's full text (the page the agent is on now; data saved from earlier pages will not be in it).` : '',
+    turn.files.length ? `Files kept for the user (downloadable): ${turn.files.map((f) => `${f.name} (${f.mime}, ${Math.round(f.size / 1024)} KB${f.source ? `, from ${short(f.source, 80)}` : ''})`).join('; ')}` : 'Files kept for the user: none.',
     `Screenshots: the system takes them by itself while the agent works (${turn.shots.length} so far, with more at the end) and shows them to the user, so a task asking for screenshots has them.`,
     `Page now: ${page.url()}`,
     `Page text (start):\n${short(text, 3500)}`,
@@ -210,6 +229,65 @@ function askTool(browser, log, turn) {
   });
 }
 
+// ---------------------------------------------------------------- files for the user
+
+/** Keeps a file for the turn (on disk with the run) and returns a short note for the agent. */
+async function keepFileForTurn(lane, turn, log, { buffer, name, mime, source }) {
+  if (turn.files.length >= FILES_PER_TURN) return `Not kept: at most ${FILES_PER_TURN} files per message.`;
+  if (source && turn.files.some((f) => f.source === source)) return 'Already kept.';
+  const id = `${turn.n}-${turn.files.length + 1}`;
+  const type = mimeOf(buffer, name, mime);
+  let clean = String(name || 'file').replace(/[^\w.\- ]+/g, '_').slice(0, 80) || 'file';
+  const ext = { 'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp', 'application/pdf': '.pdf' }[type];
+  // the name's extension follows the real type (a site may call a JPEG "image.png")
+  if (ext && /\.(png|jpe?g|gif|webp)$/i.test(clean) && !clean.toLowerCase().endsWith(ext) && !(ext === '.jpg' && /\.jpeg$/i.test(clean))) clean = clean.replace(/\.[a-z]+$/i, ext);
+  else if (ext && !/\.[a-z0-9]{2,4}$/i.test(clean)) clean += ext;
+  const meta = { id, name: clean, size: buffer.length, mime: type, source: source || '', at: new Date().toISOString() };
+  const dir = path.join(FILES_DIR, lane.runId);
+  await fs.promises.mkdir(dir, { recursive: true });
+  await fs.promises.writeFile(path.join(dir, id), buffer);
+  await fs.promises.writeFile(path.join(dir, `${id}.json`), JSON.stringify(meta));
+  turn.files.push(meta);
+  touch(lane);
+  log.success(`Kept ${clean} (${Math.max(1, Math.round(buffer.length / 1024))} KB) for you`);
+  return `${clean} (${Math.max(1, Math.round(buffer.length / 1024))} KB), the user can download it`;
+}
+
+/** Each kept file is a row of the data too (name and address), so the result and the CSV show it. */
+function addFileRows(data, files) {
+  if (!files.length) return;
+  const col = (n) => {
+    let i = data.columns.findIndex((c) => c.toLowerCase() === n.toLowerCase());
+    if (i < 0) {
+      data.columns.push(n);
+      data.rows.forEach((r) => r.push(''));
+      i = data.columns.length - 1;
+    }
+    return i;
+  };
+  const listed = JSON.stringify(data.rows);
+  files.forEach((f) => {
+    if (f.source && listed.includes(f.source)) return; // the agent saved it already
+    const iName = col('File');
+    const iUrl = col('File URL');
+    const row = data.columns.map(() => '');
+    row[iName] = f.name;
+    row[iUrl] = /^https?:/i.test(f.source) ? f.source : '(kept file, see Files)'; // a blob: / data: address only works inside that page
+    data.rows.push(row);
+  });
+}
+
+/** A kept file: { id, name, mime, size, data (base64) }. */
+function readKeptFile(runId, fileId) {
+  if (!RUN_ID.test(runId) || !FILE_ID.test(fileId)) throw new AgentError('FILE_NOT_FOUND', 'This file is no longer here.');
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(FILES_DIR, runId, `${fileId}.json`), 'utf8'));
+    return { ...meta, data: fs.readFileSync(path.join(FILES_DIR, runId, fileId)).toString('base64') };
+  } catch {
+    throw new AgentError('FILE_NOT_FOUND', 'This file is no longer here.');
+  }
+}
+
 // ---------------------------------------------------------------- screenshots
 
 /** A half-size JPEG of what the tab shows now (base64), or null. */
@@ -275,6 +353,7 @@ function laneView(lane) {
       finishedAt: t.finishedAt && new Date(t.finishedAt).toISOString(),
       steps: t.steps,
       shots: t.shots,
+      files: t.files || [], // kept for the user: { id, name, size, mime, source }
       answer: t.answer,
       data: t.data,
       usage: t.usage,
@@ -378,7 +457,7 @@ function saveRun(lane, { first = false } = {}) {
       : {
           success: lane.status !== 'failed',
           durationMs: (last.finishedAt || Date.now()) - lane.createdAt,
-          result: { kind: 'super_task', url: lane.url || last.finalUrl || '', answer: last.answer || '', data: { columns, rows: rows.map((r) => r.slice(0, columns.length)) }, steps: lane.turns.reduce((n, t) => n + t.steps.length, 0), finalUrl: last.finalUrl, usedLogin: lane.hasLogin, usage: usageOf(usage, WEB.model), shots: lane.turns.flatMap((t) => t.shots.map((sh) => ({ id: sh.id, label: sh.label, at: sh.at, message: t.n }))) },
+          result: { kind: 'super_task', url: lane.url || last.finalUrl || '', answer: last.answer || '', data: { columns, rows: rows.map((r) => r.slice(0, columns.length)) }, steps: lane.turns.reduce((n, t) => n + t.steps.length, 0), finalUrl: last.finalUrl, usedLogin: lane.hasLogin, usage: usageOf(usage, WEB.model), shots: lane.turns.flatMap((t) => t.shots.map((sh) => ({ id: sh.id, label: sh.label, at: sh.at, message: t.n }))), files: lane.turns.flatMap((t) => (t.files || []).map((fl) => ({ ...fl, message: t.n }))) },
           ...(lane.status === 'failed' ? { error: { code: 'SUPER_FAILED', message: last.error || 'The task failed.' } } : {}),
           ...(lane.status === 'incomplete' ? { note: (last.check && last.check.missing) || 'Not everything in the task could be done.' } : {}),
         },
@@ -462,6 +541,7 @@ async function runTurn(lane, turn) {
       log,
       normalizeSiteUrl,
       extraTools: (b) => [searchTool(b, log), askTool(b, log, turn)],
+      onFile: (file) => keepFileForTurn(lane, turn, log, file),
     });
     // the earlier messages (and what the agent did) carry over, so follow-ups continue the work
     const input = lane.history ? [...lane.history, { role: 'user', content: turn.message }] : turn.n === 1 ? 'Do the task now.' : turn.message;
@@ -497,6 +577,7 @@ async function runTurn(lane, turn) {
     if (out.result) lane.history = out.result.history;
     lane.lastUrl = page.url() !== 'about:blank' ? page.url() : lane.lastUrl;
     turn.finalUrl = lane.lastUrl;
+    addFileRows(data, turn.files);
     turn.data = data;
     turn.usage = usageOf(usage, WEB.model);
     const said = out.result ? scrub(String(out.result.finalOutput || '').trim()) : '';
@@ -547,7 +628,7 @@ async function runTurn(lane, turn) {
 }
 
 function newTurn(lane, message) {
-  const turn = { n: lane.turns.length + 1, message, status: 'queued', steps: [], shots: [], answer: '', data: null, usage: null };
+  const turn = { n: lane.turns.length + 1, message, status: 'queued', steps: [], shots: [], files: [], answer: '', data: null, usage: null };
   lane.turns.push(turn);
   return turn;
 }
@@ -699,6 +780,16 @@ function getShot(userId, id, shotId) {
   return { id: shotId, data };
 }
 
+/** A file kept in a lane (still on this page). */
+function getFile(userId, id, fileId) {
+  return readKeptFile(laneOf(userId, id).runId, fileId);
+}
+
+/** A file kept in a run (the caller has checked the run is the user's). */
+function runFile(runId, fileId) {
+  return readKeptFile(runId, fileId);
+}
+
 /** A saved screenshot of a run (the caller has checked the run is the user's). */
 function runShot(runId, shotId) {
   if (!RUN_ID.test(runId) || !SHOT_ID.test(shotId)) throw new AgentError('SHOT_NOT_FOUND', 'This screenshot is no longer here.');
@@ -709,4 +800,4 @@ function runShot(runId, shotId) {
   }
 }
 
-module.exports = { startLane, cancelQueued, followUp, stopLane, clearLane, listLanes, getShot, runShot, LIMITS };
+module.exports = { startLane, cancelQueued, followUp, stopLane, clearLane, listLanes, getShot, runShot, getFile, runFile, LIMITS };
