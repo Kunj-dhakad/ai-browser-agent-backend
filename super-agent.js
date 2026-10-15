@@ -32,7 +32,7 @@ const LIMITS = {
   doneShowMs: 4000, // a finished task stays on screen this long before the next one takes its place
   // super agent tabs running at the same time on this server (each is about one browser's CPU)
   maxPages: Math.max(1, parseInt(process.env.SUPER_MAX_PAGES, 10) || CONFIG.maxBrowsers),
-  stepsPerTurn: Math.min(60, Math.max(10, parseInt(process.env.SUPER_MAX_STEPS, 10) || 40)),
+  stepsPerTurn: Math.min(60, Math.max(10, parseInt(process.env.SUPER_MAX_STEPS, 10) || 50)),
   shotsPerTurn: 4, // screenshots kept per message (the last one is always the end state)
   shotGapMs: 8000, // at least this long between two screenshots
   keepLanes: 12, // lanes kept per user (oldest finished ones are dropped)
@@ -283,6 +283,23 @@ function laneView(lane) {
   };
 }
 
+/**
+ * Login details written in the message itself ("email kunj@x.com password 123456"): they become
+ * the lane's login details and the message keeps only {{USERNAME}} / {{PASSWORD}}, so the AI,
+ * the title, the history and the logs never see the password. Without a password word in the
+ * message nothing is taken (an email address in a task is usually data, not a login).
+ */
+function loginFromMessage(message) {
+  const pass = message.match(/\b(?:password|passwd|pass|pwd|पासवर्ड)\b\s*(?:is|hai|he|:|=|-)?\s*[:=-]?\s*["']?([^\s"',;]+)["']?/i);
+  if (!pass || /^\{\{/.test(pass[1])) return { message, username: '', password: '' };
+  const userWord = message.match(/\b(?:email|e-mail|mail|username|user\s*name|user|login\s*id|user\s*id|id)\b\s*(?:is|hai|he|:|=|-)?\s*[:=-]?\s*["']?([^\s"',;]+)["']?/i);
+  const email = message.match(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/);
+  const username = userWord && !/^(and|or|aur|password|pass)$/i.test(userWord[1]) ? userWord[1] : email ? email[0] : '';
+  const password = pass[1];
+  const swap = (text, value, holder) => (value ? text.split(value).join(holder) : text);
+  return { message: swap(swap(message, password, '{{PASSWORD}}'), username, '{{USERNAME}}'), username, password };
+}
+
 function checkMessage(message) {
   const m = typeof message === 'string' ? message.trim() : '';
   if (!m) throw new AgentError('INVALID_TASK', 'Write what the agent should do.');
@@ -451,10 +468,10 @@ async function runTurn(lane, turn) {
     let usage = out.usage;
     // The model sometimes stops early (gives up, only says what it would do, asks for details it
     // could choose): a check looks at the answer, the data and the page, and sends it back to
-    // work with what is missing (at most twice). Its last word also decides done / incomplete.
+    // work with what is missing (up to 4 times, while steps are left). Its last word also decides done / incomplete.
     let verdict = null;
     let cutOff = !out.result; // ran out of steps or time (or the AI failed) before answering
-    for (let round = 0; out.result && !turn.asked && !lane.abort.signal.aborted && round < 3; round++) {
+    for (let round = 0; out.result && !turn.asked && !lane.abort.signal.aborted && round < 5; round++) {
       verdict = await checkDone(lane, turn, scrub(String(out.result.finalOutput || '')), data, page);
       usage = addUsage(usage, verdict.usage);
       if (verdict.status !== 'unfinished') {
@@ -462,7 +479,7 @@ async function runTurn(lane, turn) {
         if (verdict.status === 'blocked') log.info(`Checked: it cannot be finished here${verdict.missing ? ` (${verdict.missing})` : ''}`);
         break;
       }
-      if (round === 2 || browser.steps() > LIMITS.stepsPerTurn - 4) break;
+      if (round === 4 || browser.steps() > LIMITS.stepsPerTurn - 4) break;
       log.info(`Not finished yet: ${verdict.missing || 'the task is not complete'}. Carrying on`);
       const again = await runAgent(agent, [...out.result.history, { role: 'user', content: `Not finished yet: ${verdict.missing || 'the task is not complete'}. Keep going with the tools until it is really done (check it on the page), choosing any details yourself, then give your final answer in ${answerLanguage(lane.task)}.` }], { maxTurns: LIMITS.stepsPerTurn * 2 + 10, log, browser, label: 'The agent', signal: lane.abort.signal });
       usage = addUsage(usage, again.usage);
@@ -541,9 +558,11 @@ function newTurn(lane, message) {
  * message is where it starts; without one the agent searches the web.
  */
 function startLane(userId, input = {}) {
-  const message = checkMessage(input.message);
-  const username = typeof input.username === 'string' ? input.username : '';
-  const password = typeof input.password === 'string' ? input.password : '';
+  let message = checkMessage(input.message);
+  let username = typeof input.username === 'string' ? input.username : '';
+  let password = typeof input.password === 'string' ? input.password : '';
+  // details written in the message count when none were given in the login box
+  if (!username && !password) ({ message, username, password } = loginFromMessage(message));
   if (username.length > 300 || password.length > 300) throw new AgentError('INVALID_TASK', 'The login details are too long.');
   prune(userId);
   const item = { id: crypto.randomUUID(), message, title: titleOf(message), allowOtherSites: input.allowOtherSites === true, createdAt: Date.now() };
@@ -623,8 +642,16 @@ function laneOf(userId, id) {
 /** A follow-up message on a finished lane: continues in the same chat. */
 function followUp(userId, id, input = {}) {
   const lane = laneOf(userId, id);
-  const message = checkMessage(input.message);
+  let message = checkMessage(input.message);
   if (isActive(lane)) throw new AgentError('LANE_BUSY', 'This task is still working. Wait for it to finish, or stop it first.');
+  // login details sent in a follow-up ("here is the password: …") become the lane's
+  const found = loginFromMessage(message);
+  if (found.password) {
+    message = found.message;
+    lane.secrets.PASSWORD = found.password;
+    if (found.username) lane.secrets.USERNAME = found.username;
+    lane.hasLogin = true;
+  }
   lane.abort = new AbortController();
   const turn = newTurn(lane, message);
   runTurn(lane, turn).catch((err) => console.error('[super] lane failed:', err));
