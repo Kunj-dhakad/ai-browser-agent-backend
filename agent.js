@@ -54,6 +54,8 @@ const COMPETITORS_MAX = 8; // competitor websites per task (~10-20 s each)
 const COLLECT_MAX_PAGES = 10; // list pages per data collection task (one AI request each)
 const CRM_MAX_RECORDS = 25; // records per CRM task (several AI steps each)
 const FOLLOWUP_MAX = 15; // follow-ups per task
+const LEADS_MAX = 30; // leads per lead-generation task (each website is read for an email)
+const OUTREACH_MAX = 20; // clients per outreach task (a website read + a Gmail draft each)
 
 
 function normalizeSiteUrl(raw) {
@@ -816,6 +818,80 @@ function validateTask(input) {
       const onlyTo = str(input.onlyTo, 'onlyTo', 200);
       if (onlyTo && !/^[\w.+@\- ]+$/.test(onlyTo)) fail('"Only to" must be an email address or a domain, e.g. client.com.');
       return { type: 'email_followup', olderThanDays, lookbackDays, max: intOf(input.max, 5, 1, FOLLOWUP_MAX, 'max'), mode: input.mode === 'send' ? 'send' : 'draft', notes: str(input.notes, 'notes', 500), onlyTo };
+    }
+    // Agency agents (agency-agents.js): Google Docs / Sheets / Gmail drafts with the user's Google login
+    case 'product_report': {
+      const product = str(input.product, 'product', 150);
+      if (!product) fail('Write the product to research, e.g. "Notion".');
+      const rawSite = str(input.website, 'website', 500);
+      const website = rawSite ? normalizeSiteUrl(rawSite) : '';
+      if (rawSite && !website) fail(`"${rawSite.slice(0, 80)}" is not a public website address.`);
+      return { type: 'product_report', product, website, competitors: str(input.competitors, 'competitors', 300), audience: str(input.audience, 'audience', 300), saveToDocs: input.saveToDocs !== false, docName: str(input.docName, 'docName', 150) };
+    }
+    case 'lead_generation': {
+      const agencyName = str(input.agencyName, 'agencyName', 120);
+      const industry = str(input.industry, 'industry', 120);
+      const location = str(input.location, 'location', 150);
+      if (!agencyName) fail('Write your agency name.');
+      if (!industry) fail('Write the business type to find, e.g. "Real Estate".');
+      if (!location) fail('Write the location, e.g. "Jaipur, Rajasthan".');
+      const services = str(input.services, 'services', 300);
+      if (!services) fail('Write the services to promote, e.g. "SEO and Google Ads".');
+      return {
+        type: 'lead_generation',
+        agencyName,
+        industry,
+        location,
+        count: intOf(input.count, 10, 1, LEADS_MAX, 'count'),
+        services,
+        criteria: str(input.criteria, 'criteria', 500),
+        senderName: str(input.senderName, 'senderName', 100),
+        saveToSheets: input.saveToSheets !== false,
+        draftEmails: input.draftEmails !== false,
+        maxDrafts: intOf(input.maxDrafts, 10, 0, LEADS_MAX, 'maxDrafts'),
+        sheetName: str(input.sheetName, 'sheetName', 150),
+      };
+    }
+    case 'agency_outreach': {
+      const agencyName = str(input.agencyName, 'agencyName', 120);
+      if (!agencyName) fail('Write your agency name.');
+      const rawSite = str(input.website, 'website', 500);
+      const website = rawSite ? normalizeSiteUrl(rawSite) : '';
+      if (rawSite && !website) fail(`"${rawSite.slice(0, 80)}" is not a public website address.`);
+      const services = str(input.services, 'services', 500);
+      const valueProposition = str(input.valueProposition, 'valueProposition', 500);
+      if (!services) fail('Write your agency services.');
+      if (!valueProposition) fail('Write your value proposition (why clients should work with you).');
+      const clients = str(input.clients, 'clients', 8000).replace(/\r\n/g, '\n');
+      if (!clients) fail('Add the client list: one client per line (name, website, email) or a Google Sheet link.');
+      return { type: 'agency_outreach', agencyName, website, services, valueProposition, portfolio: str(input.portfolio, 'portfolio', 500), clients, tone: str(input.tone, 'tone', 100), maxClients: intOf(input.maxClients, 20, 1, OUTREACH_MAX, 'maxClients'), shareLink: input.shareLink === true };
+    }
+    case 'proposal_builder': {
+      const agencyName = str(input.agencyName, 'agencyName', 120);
+      const clientName = str(input.clientName, 'clientName', 150);
+      const requirements = str(input.requirements, 'requirements', 2000);
+      const services = str(input.services, 'services', 500);
+      if (!agencyName) fail('Write your agency name.');
+      if (!clientName) fail('Write the client name.');
+      if (!requirements) fail('Write what the client needs.');
+      if (!services) fail('Write the services to include.');
+      const rawSheet = str(input.pricingSheet, 'pricingSheet', 500);
+      if (rawSheet && !/^https:\/\/docs\.google\.com\/spreadsheets\/d\/[\w-]{20,}/.test(rawSheet)) fail('The pricing sheet must be a Google Sheets link (https://docs.google.com/spreadsheets/d/...).');
+      const clientEmail = str(input.clientEmail, 'clientEmail', 200);
+      if (clientEmail && !/^[\w.+-]+@[\w-]+(\.[\w-]+)+$/.test(clientEmail)) fail('The client email does not look right.');
+      return {
+        type: 'proposal_builder',
+        agencyName,
+        clientName,
+        clientEmail,
+        requirements,
+        services,
+        pricingSheet: rawSheet,
+        pricingText: str(input.pricingText, 'pricingText', 3000),
+        timeline: str(input.timeline, 'timeline', 500),
+        docName: str(input.docName, 'docName', 150) || `${clientName} - Marketing Proposal`,
+        shareLink: input.shareLink === true,
+      };
     }
     default:
       return fail(`Unknown task type "${input.type}".`);
@@ -2544,7 +2620,15 @@ const TASK_HANDLERS = {
     require('./followup-agent').runFollowup(page, task, log, { SELECTORS, readMailRows, AgentError, dryRun: CONFIG.dryRun, account: getAccount(userId) }),
   // AI agent for any task on a website (web-agent.js); loaded only when used.
   web_task: (page, task, log) => require('./web-agent').runWebAgent(page, task, log, { normalizeSiteUrl, blockPrivateHosts, AgentError }),
+  // Agency agents with Google Docs / Sheets / Gmail drafts (agency-agents.js).
+  product_report: (page, task, log) => require('./agency-agents').runAgency(page, task, log, AGENCY_HELPERS),
+  lead_generation: (page, task, log) => require('./agency-agents').runAgency(page, task, log, AGENCY_HELPERS),
+  agency_outreach: (page, task, log) => require('./agency-agents').runAgency(page, task, log, AGENCY_HELPERS),
+  proposal_builder: (page, task, log) => require('./agency-agents').runAgency(page, task, log, AGENCY_HELPERS),
 };
+
+/** What the agency agents use from here: Maps leads and website contacts. */
+const AGENCY_HELPERS = { normalizeSiteUrl, blockPrivateHosts, AgentError, mapsSearch, checkSite };
 
 /** Tasks that work inside the user's Gmail (they need "Connect Gmail" first). */
 const GMAIL_TASKS = new Set(['send_email', 'search_email', 'read_inbox', 'email_followup']);
